@@ -561,11 +561,13 @@ export class DefaultModelsService implements ModelsService {
 
   async getActiveModels(provider?: string): Promise<string[]> {
     if (provider) {
-      return this.getEngine(provider)?.getLoadedModels() ?? []
+      const scoped = (await this.getEngine(provider)?.getLoadedModels()) ?? []
+      return scoped
     }
 
     const activeByProvider = await this.getLocalActiveModelsByProvider()
-    return [...new Set(activeByProvider.flatMap(({ models }) => models))]
+    const union = [...new Set(activeByProvider.flatMap(({ models }) => models))]
+    return union
   }
 
   async stopModel(

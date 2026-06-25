@@ -5,6 +5,7 @@ import type { ChatStatus } from "ai";
 import { CustomChatTransport } from "@/lib/custom-chat-transport";
 import { notifyThreadCompleted } from "@/lib/notifications";
 import { useThreadNotifications } from "@/hooks/useThreadNotifications";
+import { useThreadReadStatus } from "@/stores/thread-read-store";
 import i18n from "@/i18n/setup";
 
 export type SessionData = {
@@ -184,6 +185,14 @@ export const useChatSessions = create<ChatSessionState>((set, get) => ({
             { title: threadTitle }
           );
           void notifyThreadCompleted(notificationTitle, notificationBody);
+        }
+
+        if (
+          hasMessages &&
+          !hasPendingTools &&
+          state.activeConversationId !== sessionId
+        ) {
+          useThreadReadStatus.getState().markUnread(sessionId);
         }
       }
 

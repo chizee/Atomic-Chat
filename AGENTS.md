@@ -309,6 +309,266 @@ Append-only. Newest at top. Each entry follows this shape:
 
 ---
 
+### 2026-06-24 — Add a "Find optimal backend" button + a once-ever post-first-launch popup to the TurboQuant `llamacpp` provider on Windows/Linux (clean-id optimal detection, provider-aware `useBackendUpdater`)
+- **Context:** The 2026-06-23 ADR shipped the TurboQuant `llamacpp` provider
+ on Windows/Linux as a second provider, resolving its backend catalog from
+ the `atomic-chat-conf` turboquant manifest with clean ids
+ (`windows-x64-cuda-13.3`, `linux-x64-vulkan`, …). But the *optimal-detection*
+ path was stale: `detectIdealBackendType`
+ ([`extensions/llamacpp-extension/src/index.ts`](extensions/llamacpp-extension/src/index.ts))
+ still returned legacy janhq ids (`win-cuda-13-common_cpus-x64`) absent from
+ the manifest, so a recommendation pointed at a non-existent asset; the
+ web-app `useBackendUpdater`
+ ([`web-app/src/hooks/useBackendUpdater.ts`](web-app/src/hooks/useBackendUpdater.ts))
+ was hardwired to the upstream extension + the `llama_cpp_*` localStorage
+ keys; and the Settings "Find optimal backend" button
+ ([`web-app/src/routes/settings/providers/$providerName.tsx`](web-app/src/routes/settings/providers/$providerName.tsx))
+ was gated to `provider === LOCAL_LLAMACPP_PROVIDER` (upstream only). So a
+ TurboQuant user on Win/Linux booted on the bundled CPU build with no way to
+ discover/download a faster GPU backend, and the default-vision out-of-box
+ path (request #3, upstream-first) was already correct but unverified.
+- **Decision (per the user-chosen options — popup shown `once_ever`, scope
+ `win_linux`):**
+ 1. **Clean-id optimal detection (TurboQuant extension).**
+ `detectIdealBackendType` rewritten to pick from `listSupportedBackends()`
+ (already manifest-filtered to clean, supported ids) and return the
+ upstream-style discriminated `IdealBackendResult` (`gpu` / `cpu-optimal`
+ / `detection-failed`) + an exported `BACKEND_DETECTION_FAILED` sentinel:
+ Windows prefers `windows-x64-cuda-13.3` (cuda13) → `windows-x64-cuda-12.4`
+ (cuda12) → `windows-x64-vulkan` (vulkan + VRAM); Linux → `linux-x64-vulkan`
+ (vulkan + VRAM) else cpu-optimal. `recheckOptimalBackend` runs detection
+ under `withTimeout`, throws `BACKEND_DETECTION_FAILED` on manifest
+ unreachability, returns null on cpu-optimal, and on `gpu` resolves the
+ concrete `{ version: tag, backend: id }` straight from the catalog (each
+ turboquant entry carries its own tag), persisting + emitting
+ `onBetterBackendDetected`. `get_backend_category`/`backendCategoryToLabel`
+ updated to recognise the clean ids. Provider-specific localStorage keys
+ (`TURBOQUANT_RECOMMENDATION_KEY` / `TURBOQUANT_PENDING_KEY`) replace the
+ hardcoded `llama_cpp_*` keys to avoid collision with the upstream
+ extension (both ship on Win/Linux).
+ 2. **Provider-aware `useBackendUpdater`.** New optional
+ `UseBackendUpdaterConfig` (`extensionName` / `providerId` /
+ `recommendationKey` / `postUpgradeRecheckEnabled`), defaulting to the
+ upstream extension + existing keys. `handleBetterBackendDetected` now
+ filters events by `providerId` so the turboquant and upstream instances
+ of the hook never cross-contaminate. `$providerName.tsx` builds the config
+ with `useMemo` keyed on `providerName === 'llamacpp'` and extends the
+ button's render gate + `handleFindOptimalBackend` to fire for
+ `provider === 'llamacpp'` on `IS_WINDOWS || IS_LINUX`, reusing the
+ existing `backendUpdater.*` i18n.
+ 3. **Once-ever first-launch popup.** New
+ [`web-app/src/containers/dialogs/TurboquantOptimalBackendDialog.tsx`](web-app/src/containers/dialogs/TurboquantOptimalBackendDialog.tsx)
+ (Skip / Find optimal), mounted globally in
+ [`__root.tsx`](web-app/src/routes/__root.tsx) next to `BackendUpdater`
+ (gated on `isSetupCompleted`). It drives the whole flow through a
+ turboquant-configured `useBackendUpdater`, so detection → download →
+ hot-swap → restart-required render off the hook's `recommendationPhase`.
+ Trigger: `maybePromptTurboquantOptimal` in
+ [`switchModel.ts`](web-app/src/utils/switchModel.ts) dispatches a window
+ `TURBOQUANT_OPTIMAL_PROMPT_EVENT` on a successful start where the provider
+ is `llamacpp`, on Win/Linux, and the new
+ `localStorageKey.turboquantOptimalPromptShown` flag is unset (called on
+ both the already-active and full-load success paths). The dialog **sets
+ the flag the moment it is shown**, so it is strictly once-ever even if the
+ user dismisses with Esc or reloads mid-flow.
+ 4. **Driver-floor alignment (Part A.4).** `min_cuda13_driver` for Windows
+ in [`tauri-plugin-llamacpp/src/backend.rs`](src-tauri/plugins/tauri-plugin-llamacpp/src/backend.rs)
+ raised to the NVIDIA-documented `581.15`, matching the `llamacpp-upstream`
+ plugin.
+ 5. **Default-provider verification (request #3).** Confirmed upstream is
+ already the default everywhere (`LOCAL_LLAMACPP_PROVIDER =
+ 'llamacpp-upstream'`, `getModelToStart` order upstream-first); added the
+ missing `'llamacpp-upstream'` arm to the empty-state fallback `find` in
+ [`DropdownModelProvider.tsx`](web-app/src/containers/DropdownModelProvider.tsx)
+ (previously matched only `llamacpp | mlx`, so a fresh install with models
+ only under the upstream provider could fail to auto-select one).
+- **Consequences:** TurboQuant users on Windows/Linux now get a one-time
+ prompt after their first model start offering to download the fastest
+ backend for their hardware (CUDA/Vulkan), plus a persistent
+ Settings → Providers "Find optimal backend" button — exactly mirroring the
+ upstream provider, but resolving every id/tag from the turboquant manifest.
+ "Skip" keeps the current (bundled CPU) backend; the model is already running
+ either way. macOS turboquant (single `macos-arm64` backend) is untouched —
+ the popup and button are Win/Linux-gated. **Deliberately NOT done:** no
+ per-provider tagging of the `app:backend-hotswapped` event (pre-existing;
+ both dialog instances receive it, harmless since the global `BackendUpdater`
+ has a null turboquant recommendation); no stale-comment sweep beyond the
+ `DropdownModelProvider` fallback. **Verified:** web-app `tsc -b` clean;
+ `eslint` clean on all 7 touched web-app files; turboquant extension rolldown
+ build clean (`dist/index.js` 196.11 kB, exit 0 — the authoritative compile);
+ `cargo test --lib backend` 33/33 green in `tauri-plugin-llamacpp`; all reused
+ `backendUpdater.*` keys present and the new `turboquantOptimalPrompt.*` block
+ added in EN + RU (other locales fall back to EN). Manual Win/Linux
+ first-launch smoke test is the remaining step (no such host in the sandbox).
+- **Owner:** team.
+- **Links:** the 2026-06-23 ADR *Ship the TurboQuant `llamacpp` provider on
+ Windows + Linux …* (the manifest + clean-id foundation), the 2026-06-15 ADR
+ *Stop "Find optimal backend" from silently degrading to CPU …* (the
+ `IdealBackendResult` / `BACKEND_DETECTION_FAILED` contract this mirrors), the
+ 2026-06-09 ADR *Default the macOS local llama.cpp engine to `llamacpp-upstream`*
+ (ATO-116, upstream-first default), files:
+ [`extensions/llamacpp-extension/src/index.ts`](extensions/llamacpp-extension/src/index.ts)
+ (`detectIdealBackendType`, `recheckOptimalBackend`, `get_backend_category`,
+ `TURBOQUANT_RECOMMENDATION_KEY`/`TURBOQUANT_PENDING_KEY`),
+ [`web-app/src/hooks/useBackendUpdater.ts`](web-app/src/hooks/useBackendUpdater.ts)
+ (`UseBackendUpdaterConfig`, provider-filtered events),
+ [`web-app/src/routes/settings/providers/$providerName.tsx`](web-app/src/routes/settings/providers/$providerName.tsx)
+ (button gate + `useMemo` config),
+ [`web-app/src/containers/dialogs/TurboquantOptimalBackendDialog.tsx`](web-app/src/containers/dialogs/TurboquantOptimalBackendDialog.tsx),
+ [`web-app/src/routes/__root.tsx`](web-app/src/routes/__root.tsx),
+ [`web-app/src/utils/switchModel.ts`](web-app/src/utils/switchModel.ts)
+ (`TURBOQUANT_OPTIMAL_PROMPT_EVENT`, `maybePromptTurboquantOptimal`),
+ [`web-app/src/constants/localStorage.ts`](web-app/src/constants/localStorage.ts)
+ (`turboquantOptimalPromptShown`),
+ [`web-app/src/containers/DropdownModelProvider.tsx`](web-app/src/containers/DropdownModelProvider.tsx)
+ (empty-state fallback),
+ [`src-tauri/plugins/tauri-plugin-llamacpp/src/backend.rs`](src-tauri/plugins/tauri-plugin-llamacpp/src/backend.rs)
+ (`min_cuda13_driver`),
+ [`web-app/src/locales/en/settings.json`](web-app/src/locales/en/settings.json) +
+ [`web-app/src/locales/ru/settings.json`](web-app/src/locales/ru/settings.json)
+ (`turboquantOptimalPrompt`).
+
+### 2026-06-23 — Ship the TurboQuant `llamacpp` provider on Windows + Linux as a second provider (side-by-side with `llamacpp-upstream`), resolving the backend index from a static `atomic-chat-conf` turboquant manifest (per-backend tag) and downloading GPU variants at runtime from the `AtomicBot-ai/atomic-llama-cpp-turboquant` releases CDN
+- **Context:** Our `atomic-llama-cpp-turboquant` fork now publishes
+ Windows (`cpu` / `vulkan` / `cuda-12.4` / `cuda-13.3`) and Linux
+ (`vulkan`, with built-in CPU fallback via `GGML_BACKEND_DL`) builds, on top
+ of the existing macOS `arm64` build. Until now the turboquant `llamacpp`
+ provider (`@janhq/llamacpp-extension` + `tauri-plugin-llamacpp`) was
+ **macOS-only**: the 2026-05-22 ADR *Windows ships only `llamacpp-upstream`*
+ and the 2026-05-28 ADR *Linux ships only `llamacpp-upstream`* excluded it
+ from the Windows/Linux installer bundles (`package.json ::
+ build:extensions:{win32,linux}` carried `--exclude
+ @janhq/llamacpp-extension`), gated the whole flow behind `IS_MAC` in the
+ extension, and `fetchRemoteBackends` early-`return []`'d off macOS. Two facts
+ about the turboquant release stream forced the index-resolution shape:
+ (1) **the releases are scattered — each variant is its OWN GitHub release
+ with its OWN tag** (all on the same SHA, e.g. `d86eb0b`: tags
+ `turboquant-windows-x64-cpu-d86eb0b`, `turboquant-windows-x64-cuda-12.4-…`,
+ `turboquant-linux-x64-vulkan-…`, …), so a `/releases/latest` lookup is
+ useless and a `/releases` list scan would hammer the rate-limited
+ `api.github.com` (the exact problem the 2026-06-17 ATO-199 ADR solved for
+ upstream); and (2) the Windows CUDA zips **already bundle**
+ `cudart64`/`cublas64`/`cublasLt64` DLLs, so the janhq-style separate-cudart
+ download is unnecessary.
+- **Decision (per the user-chosen options — `side_by_side` provider,
+ `download_variants` runtime delivery, `clean` release-aligned id scheme):**
+ 1. **Clean backend-ID scheme** (directly mirrors the release asset names):
+ `windows-x64-cpu`, `windows-x64-cuda-12.4`, `windows-x64-cuda-13.3`,
+ `windows-x64-vulkan`, `linux-x64-vulkan`, `macos-arm64`. Asset =
+ `llama-turboquant-<id>.zip` (Windows) / `.tar.gz` (Linux/macOS); per-id
+ tag prefix = `turboquant-<id>`.
+ 2. **Static turboquant manifest in `atomic-chat-conf`** (extends the
+ 2026-06-17 ATO-199 channel precedent). New `backends/turboquant-manifest.json`
+ (`{ $schema, updated_at, commit, backends: [{ id, tag, asset }] }`, seeded
+ from the `d86eb0b` set — 4 Windows ids + `linux-x64-vulkan`) +
+ `backends/turboquant-schema.json` (Draft-07) + a `Validate turboquant
+ manifest` ajv job and a node integrity check in
+ [`.github/workflows/validate.yml`](https://github.com/AtomicBot-ai/atomic-chat-conf)
+ (every `tag` starts `turboquant-<id>`, asset matches
+ `llama-turboquant-<id>.(zip|tar.gz)`, ids unique). **The only structural
+ difference from the upstream manifest** (single `tag_name` + `assets`) is
+ that **each turboquant entry carries its own `tag`**, because the variants
+ live in different releases. The archive *downloads* still come from the
+ releases CDN (`github.com/.../releases/download`, not rate-limited).
+ 3. **Rust** ([`tauri-plugin-llamacpp/src/backend.rs`](src-tauri/plugins/tauri-plugin-llamacpp/src/backend.rs)):
+ `determine_supported_backends` rewritten to the clean ids
+ (windows/x86_64 → always `windows-x64-cpu` + conditionally
+ `windows-x64-cuda-13.3` / `-cuda-12.4` / `-vulkan`; linux/x86_64 → always
+ `linux-x64-vulkan`; macOS keeps `macos-arm64`);
+ `get_backend_category` / `prioritize_backends` / `map_old_backend_to_new`
+ (maps persisted legacy janhq ids onto the clean ids) /
+ `is_cuda_installed` (cudart lives in the backend's own `build/bin`, no
+ janhq migration path) updated; the `#[cfg(test)]` matrix asserts the new
+ ids (33 backend tests green).
+ 4. **TS** ([`extensions/llamacpp-extension/src/backend.ts`](extensions/llamacpp-extension/src/backend.ts)):
+ new `TURBOQUANT_BACKEND_MANIFEST_URL`
+ (`raw.githubusercontent.com/AtomicBot-ai/atomic-chat-conf/main/backends/turboquant-manifest.json`);
+ `fetchRemoteBackends` drops the `IS_MAC → []` early return, fetches the
+ manifest (tauriFetch + `globalThis.fetch` fallback race, mirroring the
+ upstream helper), keeps entries whose `id` is in the hardware-supported set,
+ and emits `{ version: entry.tag, backend: entry.id }` (`[]` on any failure
+ — preserves the offline-fallback contract); `getBackendDownloadUrl` builds
+ `${BASE}/${tag}/llama-turboquant-${id}.${zip|tar.gz}`; the cudart companion
+ logic (`getCudartDownloadUrl`/`CUDART_*`) is removed; `listSupportedBackends`
+ now applies the hardware gate on Linux too.
+ [`index.ts`](extensions/llamacpp-extension/src/index.ts): `IS_MAC` gates
+ around `configureBackends`/`ensureBackendReady` removed, `ensureCudartReady`
+ skipped for turboquant, bundled-fallback install wired for Win
+ (`windows-x64-cpu`) / Linux (`linux-x64-vulkan`).
+ 5. **Build & bundling:** [`package.json`](package.json) un-excludes
+ `@janhq/llamacpp-extension` on `build:extensions:{win32,linux}` (the
+ turboquant `.tgz` now ships in `pre-install/`);
+ `resources/llamacpp-backend/**/*` added to
+ [`tauri.windows.conf.json`](src-tauri/tauri.windows.conf.json) +
+ [`tauri.linux.conf.json`](src-tauri/tauri.linux.conf.json);
+ [`Makefile`](Makefile) `download-llamacpp-backend` Windows/Linux branches
+ now resolve `tag`+`asset` from the turboquant manifest
+ (`curl … --retry 5 --retry-delay 3` + `jq`, or PowerShell
+ `Invoke-RestMethod` in the new `download-llamacpp-backend-win-cpu` target)
+ and pull the bundled offline fallback (`windows-x64-cpu` / `linux-x64-vulkan`)
+ from the releases CDN into `resources/llamacpp-backend/build/bin`.
+ 6. **CI** ([`.github/workflows/release.yml`](.github/workflows/release.yml)):
+ `build-windows` gains a manifest-driven `windows-x64-cpu` download step
+ (inline bash + `jq` — not `make …-win-cpu`, whose PowerShell `$(...)` is
+ mangled by make's `/usr/bin/sh`); `build-linux-x64` calls
+ `make download-llamacpp-backend` for `linux-x64-vulkan`.
+ 7. **web-app** ([`web-app/src/lib/utils.ts`](web-app/src/lib/utils.ts)):
+ `getProviderTitle('llamacpp')` now unconditionally returns `'Atomic
+ Llama.cpp Turboquant'` (the `IS_WINDOWS/IS_LINUX → 'Llama.cpp'` vestige is
+ gone). `LOCAL_LLAMACPP_PROVIDER` stays `'llamacpp-upstream'` (default
+ unchanged); `getModelToStart` order already lists turboquant second.
+- **Consequences:** Windows and Linux now show **two** llama.cpp providers —
+ the default `llamacpp-upstream` plus the secondary "Atomic Llama.cpp
+ Turboquant" — exactly like macOS. Turboquant GPU variants download at
+ runtime from the releases CDN (CUDA zips carry their own cudart); the
+ bundled `windows-x64-cpu` / `linux-x64-vulkan` build is the always-available
+ offline fallback. Both providers share the GGUF tree
+ (`MODELS_PROVIDER_ROOT='llamacpp'`); backend binaries and settings stay
+ isolated per provider. Updating turboquant to a new commit = edit one
+ manifest file in `atomic-chat-conf` (no app release, no `api.github.com`).
+ **This supersedes the Windows-only / Linux-only `llamacpp-upstream`
+ clauses of the 2026-05-22 and 2026-05-28 ADRs** (upstream remains the
+ *default* provider on both, but turboquant is no longer excluded) and
+ **extends the manifest-channel precedent of the 2026-06-17 ATO-199 ADR**
+ (per-backend `tag` instead of a single `tag_name`). **Deliberately NOT
+ done (out of scope):** no CUDA-on-Linux turboquant (the fork publishes
+ none — Linux Vulkan serves both CPU and GPU); no change to the
+ `:1337/v1` proxy contract (it already routes the turboquant + upstream +
+ MLX pools); no cron auto-generator for the manifest (hand-maintained,
+ same as the upstream ADR); no legacy `jan*` renames. macOS is unchanged.
+ **Verified:** `cargo test --lib backend` 33/33 green in
+ `tauri-plugin-llamacpp`; `turboquant-manifest.json` valid against
+ `turboquant-schema.json` (`ajv --strict=false`) and the node integrity
+ check passes (5 backends, tags/assets well-formed, ids unique); the
+ `llamacpp-extension` rolldown build is clean (the authoritative compile);
+ web-app `tsc -b` + `eslint src/lib/utils.ts` clean; `make -n
+ download-llamacpp-backend` parses on both the Windows (PowerShell) and
+ Linux (bash+jq) branches. The extension `vitest` run hits a pre-existing
+ `ERR_REQUIRE_ESM` env issue (vitest/vite version mismatch in the hoisted
+ root `node_modules`) unrelated to this change.
+- **Owner:** team.
+- **Links:** the 2026-06-17 ADR *Resolve the `llamacpp-upstream` backend
+ index from a static `atomic-chat-conf` manifest …* (ATO-199, the
+ manifest-channel precedent), the 2026-05-22 ADR *Windows ships only
+ `llamacpp-upstream`*, the 2026-05-28 ADR *Linux ships only
+ `llamacpp-upstream`*, the 2026-05-19 ADRs *Use
+ `AtomicBot-ai/atomic-llama-cpp-turboquant` as the LLM backend* and *Ship
+ upstream `ggml-org/llama.cpp` as a second macOS provider*, §4.2 *LLM
+ backend*,
+ [AtomicBot-ai/atomic-llama-cpp-turboquant releases](https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant/releases),
+ files:
+ [`src-tauri/plugins/tauri-plugin-llamacpp/src/backend.rs`](src-tauri/plugins/tauri-plugin-llamacpp/src/backend.rs),
+ [`extensions/llamacpp-extension/src/backend.ts`](extensions/llamacpp-extension/src/backend.ts),
+ [`extensions/llamacpp-extension/src/index.ts`](extensions/llamacpp-extension/src/index.ts),
+ [`package.json`](package.json),
+ [`src-tauri/tauri.windows.conf.json`](src-tauri/tauri.windows.conf.json),
+ [`src-tauri/tauri.linux.conf.json`](src-tauri/tauri.linux.conf.json),
+ [`Makefile`](Makefile),
+ [`.github/workflows/release.yml`](.github/workflows/release.yml),
+ [`web-app/src/lib/utils.ts`](web-app/src/lib/utils.ts), and
+ `atomic-chat-conf` `backends/turboquant-manifest.json` +
+ `backends/turboquant-schema.json` + `.github/workflows/validate.yml`.
+
 ### 2026-06-17 — Resolve the `llamacpp-upstream` backend *index* from a static `atomic-chat-conf` manifest (raw.githubusercontent.com) instead of the rate-limited `api.github.com` (ATO-199)
 - **Context:** `fetchRemoteBackends()` in
  [`extensions/llamacpp-upstream-extension/src/backend.ts`](extensions/llamacpp-upstream-extension/src/backend.ts)

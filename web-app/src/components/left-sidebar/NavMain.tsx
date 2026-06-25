@@ -9,7 +9,7 @@ import {
 import { Kbd, KbdGroup } from '@/components/ui/kbd'
 import { useTranslation } from '@/i18n/react-i18next-compat'
 
-import { Link, useNavigate } from '@tanstack/react-router'
+import { Link, useNavigate, useLocation } from '@tanstack/react-router'
 import { PlatformMetaKey } from '@/containers/PlatformMetaKey'
 import React, { useRef } from 'react'
 import {
@@ -72,6 +72,16 @@ function NewBadge() {
       {t('common:newBadge')}
     </span>
   )
+}
+
+// Highlight a nav entry while its page is open. Only items with a `url`
+// (Models, Integrations, Settings) are persistent destinations; action items
+// (new chat, new project, search) have no `url` and never highlight. Matches on
+// the section root so Settings stays active across its sub-pages.
+const isNavItemActive = (pathname: string, url?: string): boolean => {
+  if (!url) return false
+  const root = '/' + (url.split('/').filter(Boolean)[0] ?? '')
+  return pathname === root || pathname.startsWith(root + '/')
 }
 
 const getNavMainItems = (
@@ -182,6 +192,7 @@ function NavMainItemWithAnimatedIcon({
       <SidebarMenuButton
         asChild={!!item.url}
         isActive={item.isActive}
+        className="data-[active=true]:bg-sidebar-foreground/15"
         onMouseEnter={() => iconRef.current?.startAnimation()}
         onMouseLeave={() => iconRef.current?.stopAnimation()}
         onClick={item.onClick}
@@ -195,6 +206,7 @@ function NavMainItemWithAnimatedIcon({
 export function NavMain() {
   const { t } = useTranslation()
   const navigate = useNavigate()
+  const { pathname } = useLocation()
   const { addFolder } = useThreadManagement()
   const { open: searchOpen, setOpen: setSearchOpen } = useSearchDialog()
   const { open: projectDialogOpen, setOpen: setProjectDialogOpen } =
@@ -219,6 +231,7 @@ export function NavMain() {
         ? { ...item, badge: undefined }
         : item
     )
+    .map((item) => ({ ...item, isActive: isNavItemActive(pathname, item.url) }))
 
   const handleCreateProject = async (name: string, assistantId?: string) => {
     const newProject = await addFolder(name, assistantId)
@@ -249,6 +262,7 @@ export function NavMain() {
               <SidebarMenuButton
                 asChild={!!item.url}
                 isActive={item.isActive}
+                className="data-[active=true]:bg-sidebar-foreground/15"
                 onClick={item.onClick}
               >
                 {item.url ? (

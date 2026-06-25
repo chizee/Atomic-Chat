@@ -3,6 +3,7 @@ import { createRootRoute, Outlet } from '@tanstack/react-router'
 
 import DialogAppUpdater from '@/containers/dialogs/AppUpdater'
 import BackendUpdater from '@/containers/dialogs/BackendUpdater'
+import TurboquantOptimalBackendDialog from '@/containers/dialogs/TurboquantOptimalBackendDialog'
 import { Fragment } from 'react/jsx-runtime'
 import { ThemeProvider } from '@/providers/ThemeProvider'
 import { InterfaceProvider } from '@/providers/InterfaceProvider'
@@ -101,7 +102,13 @@ const AppLayout = () => {
         <KeyboardShortcutsProvider />
         {/* Fake absolute panel top to enable window drag */}
         {IS_WINDOWS && <WindowControls />}
-        {!IS_LINUX && (
+        {/* On Windows we use a fixed overlay for the drag region.
+            On macOS we attach data-tauri-drag-region directly to the
+            SidebarHeader and HeaderPage elements so that the drag area is
+            always the topmost element in those regions (the fixed overlay at
+            z-20 is covered by header content at the same z-level and
+            therefore never receives mousedown events on macOS). */}
+        {IS_WINDOWS && (
           <div
             className="fixed w-full h-12 z-20 top-0"
             data-tauri-drag-region
@@ -109,6 +116,7 @@ const AppLayout = () => {
         )}
         <DialogAppUpdater />
         {isSetupCompleted && <BackendUpdater />}
+        {isSetupCompleted && <TurboquantOptimalBackendDialog />}
         <WhatsNewDialog />
         <LeftSidebar />
         <SidebarInset>

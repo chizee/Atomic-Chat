@@ -7,6 +7,7 @@ import { useAgentMode } from '@/hooks/useAgentMode'
 import { ExtensionManager } from '@/lib/extension'
 import { ExtensionTypeEnum, VectorDBExtension } from '@janhq/core'
 import posthog from 'posthog-js'
+import { useThreadReadStatus } from '@/stores/thread-read-store'
 
 type ThreadState = {
   threads: Record<string, Thread>
@@ -165,6 +166,7 @@ export const useThreads = create<ThreadState>()((set, get) => ({
       // eslint-disable-next-line @typescript-eslint/no-unused-vars
       const { [threadId]: _, ...remainingThreads } = state.threads
 
+      useThreadReadStatus.getState().removeThread(threadId)
       // Clean up agent mode state
       useAgentMode.getState().removeThread(threadId)
       // Clean up vector DB collection
@@ -197,6 +199,7 @@ export const useThreads = create<ThreadState>()((set, get) => ({
 
       // Delete threads and clean up their vector DB collections
       threadsToDeleteIds.forEach((threadId) => {
+        useThreadReadStatus.getState().removeThread(threadId)
         cleanupVectorDB(threadId)
         getServiceHub().threads().deleteThread(threadId)
       })
@@ -223,6 +226,7 @@ export const useThreads = create<ThreadState>()((set, get) => ({
       // Delete all threads and clean up their vector DB collections
       allThreadIds.forEach((threadId) => {
         useAgentMode.getState().removeThread(threadId)
+        useThreadReadStatus.getState().removeThread(threadId)
         cleanupVectorDB(threadId)
         getServiceHub().threads().deleteThread(threadId)
       })
@@ -248,6 +252,7 @@ export const useThreads = create<ThreadState>()((set, get) => ({
 
       // Delete threads and clean up their vector DB collections
       toDeleteSet.forEach((threadId) => {
+        useThreadReadStatus.getState().removeThread(threadId)
         cleanupVectorDB(threadId)
         getServiceHub().threads().deleteThread(threadId)
       })
