@@ -1710,6 +1710,170 @@ fn apply_login_path(cmd: &mut std::process::Command) {
 #[cfg(windows)]
 fn apply_login_path(_cmd: &mut std::process::Command) {}
 
+/// Re-read the persisted Windows PATH (User + Machine) from the registry and
+/// merge it with the live process PATH. The GUI snapshots PATH once at startup
+/// via `fix_path_env::fix()`, so a Node/npm installed after launch is invisible
+/// to spawned subprocesses until restart; reading the registry here recovers it.
+/// Returns the merged, de-duplicated PATH, or None if the registry read failed.
+#[cfg(windows)]
+fn refresh_windows_path() -> Option<String> {
+    use std::process::Command;
+
+    fn read_scope(scope: &str) -> Option<String> {
+        let mut cmd = Command::new("powershell");
+        cmd.args([
+            "-NoProfile",
+            "-Command",
+            &format!("[Environment]::GetEnvironmentVariable('Path', '{}')", scope),
+        ]);
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        let out = cmd.output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    }
+
+    let user = read_scope("User");
+    let machine = read_scope("Machine");
+    if user.is_none() && machine.is_none() {
+        return None;
+    }
+
+    let live = std::env::var("PATH").unwrap_or_default();
+    let mut merged: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for chunk in [machine.as_deref(), user.as_deref(), Some(live.as_str())]
+        .into_iter()
+        .flatten()
+    {
+        for part in chunk.split(';').map(str::trim).filter(|p| !p.is_empty()) {
+            let key = part.to_lowercase();
+            if seen.insert(key) {
+                merged.push(part.to_string());
+            }
+        }
+    }
+    if merged.is_empty() {
+        None
+    } else {
+        Some(merged.join(";"))
+    }
+}
+
+/// Apply the freshly-read registry PATH to a spawned command (Windows only).
+/// No-op off Windows or when the registry read fails (the inherited PATH stands).
+#[cfg(windows)]
+fn apply_runtime_path(cmd: &mut std::process::Command) {
+    if let Some(path) = refresh_windows_path() {
+        cmd.env("PATH", path);
+    }
+}
+
+#[cfg(not(windows))]
+fn apply_runtime_path(_cmd: &mut std::process::Command) {}
+
+/// Proxy details forwarded from the app's in-app proxy config so that spawned
+/// agent installers/terminals can reach the network when the user is behind a
+/// region block. Mirrors the frontend `useProxyConfig` store fields we need.
+#[derive(serde::Deserialize)]
+pub struct ProxyEnv {
+    pub url: String,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub no_proxy: Option<String>,
+}
+
+/// Inject basic-auth credentials into a proxy URL when both are present and the
+/// URL does not already carry credentials. Returns the URL unchanged otherwise.
+fn proxy_url_with_auth(url: &str, username: Option<&str>, password: Option<&str>) -> String {
+    let user = match username.map(str::trim).filter(|u| !u.is_empty()) {
+        Some(u) => u,
+        None => return url.to_string(),
+    };
+    // Only splice credentials into a scheme://host URL that has no `@` already.
+    if let Some(scheme_end) = url.find("://") {
+        let (scheme, rest) = url.split_at(scheme_end + 3);
+        if rest.contains('@') {
+            return url.to_string();
+        }
+        let pass = password.unwrap_or("");
+        return format!("{}{}:{}@{}", scheme, user, pass, rest);
+    }
+    url.to_string()
+}
+
+/// Apply the app proxy to a spawned command's environment so child installers
+/// (`uv`/`curl`/npm/PowerShell) can reach the network. Sets the common
+/// HTTP/HTTPS/ALL_PROXY variables (upper- and lower-case) plus NO_PROXY, always
+/// keeping loopback in NO_PROXY so the local server stays reachable.
+///
+/// Best-effort: `uv`/`curl` honor `ALL_PROXY`/SOCKS; npm and PowerShell
+/// `Invoke-RestMethod` largely ignore SOCKS env (handled by clearer messaging).
+fn apply_proxy_env(cmd: &mut std::process::Command, proxy: &ProxyEnv) {
+    let url = proxy.url.trim();
+    if url.is_empty() {
+        return;
+    }
+    let full = proxy_url_with_auth(
+        url,
+        proxy.username.as_deref(),
+        proxy.password.as_deref(),
+    );
+
+    for key in ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] {
+        cmd.env(key, &full);
+    }
+
+    let mut no_proxy = proxy
+        .no_proxy
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("")
+        .to_string();
+    for loopback in ["localhost", "127.0.0.1", "::1"] {
+        if !no_proxy
+            .split(',')
+            .any(|p| p.trim().eq_ignore_ascii_case(loopback))
+        {
+            if !no_proxy.is_empty() {
+                no_proxy.push(',');
+            }
+            no_proxy.push_str(loopback);
+        }
+    }
+    cmd.env("NO_PROXY", &no_proxy);
+    cmd.env("no_proxy", &no_proxy);
+}
+
+/// Detect a DNS/tunnel failure signature in installer output so we can append an
+/// actionable proxy hint to the surfaced error.
+fn output_indicates_network_failure(output: &str) -> bool {
+    let lower = output.to_lowercase();
+    [
+        "os error 11001",
+        "dns error",
+        "tunnel error",
+        "wsahost_not_found",
+        "failed to lookup address",
+        "could not resolve host",
+        "getaddrinfo",
+        "temporary failure in name resolution",
+        "network is unreachable",
+        "etimedout",
+        "econnrefused",
+    ]
+    .iter()
+    .any(|sig| lower.contains(sig))
+}
+
 /// Result of probing whether an external CLI agent is reachable.
 #[derive(serde::Serialize)]
 pub struct AgentDetection {
@@ -1726,6 +1890,9 @@ async fn detect_on_native_path(bin: &str) -> bool {
     let mut cmd = std::process::Command::new(which_cmd);
     cmd.arg(bin);
     apply_login_path(&mut cmd);
+    // On Windows, re-read the registry PATH so a tool installed after the app
+    // launched is found without a restart. No-op elsewhere.
+    apply_runtime_path(&mut cmd);
 
     #[cfg(windows)]
     {
@@ -1819,16 +1986,21 @@ pub async fn detect_agent_installed(
 pub async fn install_agent<R: Runtime>(
     app_handle: AppHandle<R>,
     agent_id: String,
+    proxy: Option<ProxyEnv>,
 ) -> Result<(), String> {
     let (program, args, prereq, docs) = agent_install_spec(&agent_id)?;
 
+    // `detect_on_native_path` re-reads the registry PATH at runtime on Windows
+    // so a Node/npm installed after the app launched (or present in the registry
+    // but not the GUI's snapshotted PATH) is found without an app restart.
     if !detect_agent_installed(prereq.to_string(), None)
         .await
         .installed
     {
         return Err(format!(
             "'{}' is required to install this agent but was not found on PATH. \
-             Install it first, then try again: {}",
+             Install it (Node.js from https://nodejs.org for npm-based agents), \
+             then restart Atomic Chat and try again: {}",
             prereq, docs
         ));
     }
@@ -1836,48 +2008,75 @@ pub async fn install_agent<R: Runtime>(
     let event = format!("agent_install_log:{}", agent_id);
     let agent_id_log = agent_id.clone();
 
-    let success = tokio::task::spawn_blocking(move || -> Result<bool, String> {
-        use std::io::{BufRead, BufReader};
-        use std::process::{Command, Stdio};
+    let (success, captured) =
+        tokio::task::spawn_blocking(move || -> Result<(bool, String), String> {
+            use std::io::{BufRead, BufReader};
+            use std::process::{Command, Stdio};
 
-        let mut cmd = Command::new(&program);
-        cmd.args(&args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        // Find `npm`/`curl`/`powershell` even when launched from Finder/Dock
-        // with a minimal PATH (macOS/Linux); no-op on Windows.
-        apply_login_path(&mut cmd);
-
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        }
-
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("Failed to spawn '{}': {}", program, e))?;
-
-        if let Some(stdout) = child.stdout.take() {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                let _ = app_handle.emit(&event, line);
+            let mut cmd = Command::new(&program);
+            cmd.args(&args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            // Find `npm`/`curl`/`powershell` even when launched from Finder/Dock
+            // with a minimal PATH (macOS/Linux); no-op on Windows.
+            apply_login_path(&mut cmd);
+            // On Windows, augment with the freshly-read registry PATH.
+            apply_runtime_path(&mut cmd);
+            // Forward the app proxy so the installer can reach the network when
+            // the user is behind a region block.
+            if let Some(ref proxy) = proxy {
+                apply_proxy_env(&mut cmd, proxy);
             }
-        }
-        if let Some(stderr) = child.stderr.take() {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                let _ = app_handle.emit(&event, line);
-            }
-        }
 
-        let status = child.wait().map_err(|e| e.to_string())?;
-        Ok(status.success())
-    })
-    .await
-    .map_err(|e| e.to_string())??;
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+            }
+
+            let mut child = cmd
+                .spawn()
+                .map_err(|e| format!("Failed to spawn '{}': {}", program, e))?;
+
+            // Accumulate output (bounded) so we can classify network failures.
+            let mut captured = String::new();
+            if let Some(stdout) = child.stdout.take() {
+                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                    if captured.len() < 16_384 {
+                        captured.push_str(&line);
+                        captured.push('\n');
+                    }
+                    let _ = app_handle.emit(&event, line);
+                }
+            }
+            if let Some(stderr) = child.stderr.take() {
+                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                    if captured.len() < 16_384 {
+                        captured.push_str(&line);
+                        captured.push('\n');
+                    }
+                    let _ = app_handle.emit(&event, line);
+                }
+            }
+
+            let status = child.wait().map_err(|e| e.to_string())?;
+            Ok((status.success(), captured))
+        })
+        .await
+        .map_err(|e| e.to_string())??;
 
     if success {
         log::info!("Agent '{}' installed successfully", agent_id_log);
         Ok(())
+    } else if output_indicates_network_failure(&captured) {
+        Err(format!(
+            "The installer for '{}' could not reach the network (DNS/connection \
+             failure). If you are behind a region block, configure a proxy in \
+             Settings -> HTTPS Proxy and try again. Note: SOCKS proxies may not \
+             work for npm/PowerShell-based installers - prefer an HTTP/HTTPS \
+             proxy for these. See the install log for details.",
+            agent_id_log
+        ))
     } else {
         Err(format!(
             "The installer for '{}' exited with a non-zero status. See the install log for details.",
@@ -3088,7 +3287,10 @@ pub fn configure_cline(
 /// using a just-configured agent in one click. The terminal stays open after
 /// the command (it launches an interactive TUI agent like codex/claude).
 #[tauri::command]
-pub fn open_agent_terminal(command: String) -> Result<(), String> {
+pub fn open_agent_terminal(
+    command: String,
+    proxy: Option<ProxyEnv>,
+) -> Result<(), String> {
     let command = command.trim().to_string();
     if command.is_empty() {
         return Err("Empty terminal command".to_string());
@@ -3098,6 +3300,7 @@ pub fn open_agent_terminal(command: String) -> Result<(), String> {
     {
         // Escape for an AppleScript double-quoted string literal.
         let escaped = command.replace('\\', "\\\\").replace('"', "\\\"");
+        let _ = &proxy;
         // When Terminal.app is *not* already running, `activate` opens a default
         // empty window and `do script` opens a second one — two windows. So we
         // branch: if it was already running, open a fresh window (don't hijack
@@ -3128,9 +3331,14 @@ pub fn open_agent_terminal(command: String) -> Result<(), String> {
     {
         // `start "" cmd /K <cmd>` opens a fresh console that stays open so the
         // interactive agent keeps running. The empty "" is the window title arg.
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", "cmd", "/K", &command])
-            .spawn()
+        // The new console inherits this command's environment, so the proxy env
+        // applied below reaches the interactive agent.
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/C", "start", "", "cmd", "/K", &command]);
+        if let Some(ref proxy) = proxy {
+            apply_proxy_env(&mut cmd, proxy);
+        }
+        cmd.spawn()
             .map_err(|e| format!("Failed to open terminal: {}", e))?;
         log::info!("Opened cmd with command: {}", command);
         return Ok(());
@@ -3151,6 +3359,10 @@ pub fn open_agent_terminal(command: String) -> Result<(), String> {
             let mut cmd = std::process::Command::new(term);
             cmd.args(*pre);
             cmd.args(["bash", "-lc", &inner]);
+            // The emulator inherits this env; `bash -lc` then sees the proxy.
+            if let Some(ref proxy) = proxy {
+                apply_proxy_env(&mut cmd, proxy);
+            }
             if cmd.spawn().is_ok() {
                 log::info!("Opened {} with command: {}", term, command);
                 return Ok(());

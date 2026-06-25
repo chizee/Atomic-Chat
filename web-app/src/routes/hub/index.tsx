@@ -261,8 +261,15 @@ function HubContent() {
     // Apply downloaded filter
     if (showOnlyDownloaded) {
       const providerState = useModelProvider.getState()
-      const llamacppModels =
-        providerState.getProviderByName('llamacpp')?.models ?? []
+      // Merge models from BOTH local llama.cpp providers — the turboquant
+      // `llamacpp` fork AND the vanilla `llamacpp-upstream` build. On
+      // Windows/Linux the downloaded model is registered under
+      // `llamacpp-upstream` (the default), so consulting only `llamacpp`
+      // hid downloaded models from the "Downloaded" filter.
+      const llamacppModels = [
+        ...(providerState.getProviderByName('llamacpp')?.models ?? []),
+        ...(providerState.getProviderByName('llamacpp-upstream')?.models ?? []),
+      ]
       const mlxModels = providerState.getProviderByName('mlx')?.models ?? []
 
       const matchedLlamacppIds = new Set<string>()

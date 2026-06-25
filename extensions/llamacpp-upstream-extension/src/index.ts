@@ -1370,6 +1370,21 @@ export default class llamacpp_upstream_extension extends AIEngine {
         }
       }
 
+      // Integrated-only hosts (Intel UHD / AMD Vega iGPU backed by shared
+      // system RAM) report >=6 GiB of "VRAM" yet run the Vulkan backend far
+      // slower than plain CPU inference. Only offer Vulkan as the *optimal*
+      // pick when a discrete GPU is present; otherwise fall through to CPU.
+      // Vulkan stays manually installable in Settings -> Providers.
+      const hasDiscreteGpu = sysInfo.gpus.some(
+        (g) => g.vulkan_info?.device_type === 'DiscreteGpu' || !!g.nvidia_info
+      )
+      const integratedGpuOnly =
+        !hasDiscreteGpu &&
+        sysInfo.gpus.length > 0 &&
+        sysInfo.gpus.every(
+          (g) => g.vulkan_info?.device_type === 'IntegratedGpu'
+        )
+
       const arch = sysInfo.cpu.arch
       const archSuffix =
         arch.includes('aarch64') || arch.includes('arm64') ? 'arm64' : 'x64'
@@ -1410,7 +1425,7 @@ export default class llamacpp_upstream_extension extends AIEngine {
         const tiers: string[] = []
         if (features.cuda13 && cuda13Backend) tiers.push(cuda13Backend)
         if (features.cuda12 && cuda12Backend) tiers.push(cuda12Backend)
-        if (features.vulkan && hasEnoughVram && vulkanBackend)
+        if (features.vulkan && hasEnoughVram && vulkanBackend && !integratedGpuOnly)
           tiers.push(vulkanBackend)
 
         for (const tier of tiers) {
@@ -1431,7 +1446,7 @@ export default class llamacpp_upstream_extension extends AIEngine {
         const gpuCapable =
           features.cuda13 ||
           features.cuda12 ||
-          (features.vulkan && hasEnoughVram)
+          (features.vulkan && hasEnoughVram && !integratedGpuOnly)
         const anyGpuBackendAvailable = availableBackends.some((b) =>
           /-(cuda-\d|vulkan)-/.test(b.backend)
         )
@@ -1459,7 +1474,12 @@ export default class llamacpp_upstream_extension extends AIEngine {
       // a 404 at download time. `determine_supported_backends` in the
       // Rust plugin mirrors this matrix.
       if (sysInfo.os_type === 'linux') {
-        if (features.vulkan && hasEnoughVram && archSuffix === 'x64') {
+        if (
+          features.vulkan &&
+          hasEnoughVram &&
+          archSuffix === 'x64' &&
+          !integratedGpuOnly
+        ) {
           return { kind: 'gpu', backend: 'linux-vulkan-x64' }
         }
         // Linux detection consults no network stream (the Vulkan recommend
@@ -2612,9 +2632,8 @@ export default class llamacpp_upstream_extension extends AIEngine {
       // check if model.yml exists
       const modelConfigPath = await joinPath([currentDir, 'model.yml'])
       if (await fs.existsSync(modelConfigPath)) {
-        // +1 to remove the leading slash
-        // NOTE: this does not handle Windows path \\
-        modelIds.push(currentDir.slice(modelsDir.length + 1))
+        // Normalize Windows '\' to '/' so the id matches the catalog
+        modelIds.push(currentDir.slice(modelsDir.length + 1).replace(/\\/g, '/'))
         continue
       }
 
@@ -2723,9 +2742,8 @@ export default class llamacpp_upstream_extension extends AIEngine {
               })
               const legacyModelPath = legacyModelConfig.files?.[0]
               if (!legacyModelPath) continue
-              // +1 to remove the leading slash
-              // NOTE: this does not handle Windows path \\
-              let modelId = currentDir.slice(modelsDir.length + 1)
+              // Normalize Windows '\' to '/' so the id matches the catalog
+              let modelId = currentDir.slice(modelsDir.length + 1).replace(/\\/g, '/')
 
               modelId =
                 modelId !== 'imported'

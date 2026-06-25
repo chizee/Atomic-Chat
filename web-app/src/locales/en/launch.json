@@ -44,6 +44,7 @@
     "installSuccess": "{{name}} installed",
     "installSuccessDesc": "{{name}} was installed successfully.",
     "installFailed": "Failed to install {{name}}",
+    "installFailedNetworkDesc": "The installer couldn't reach the network. If you're behind a region block, set an HTTP/HTTPS proxy in Settings → HTTPS Proxy and try again. Note: SOCKS proxies often don't work for npm/PowerShell-based installers.",
     "configured": "{{name}} configured",
     "configuredDesc": "{{name}} now points at your local server — opening a terminal.",
     "configuredDescEditor": "{{name}} now points at your local server — opening the editor.",

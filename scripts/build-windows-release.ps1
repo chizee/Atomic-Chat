@@ -263,6 +263,18 @@ Write-Step 'Generating icons'
 yarn tauri icon ./src-tauri/icons/icon.png
 if ($LASTEXITCODE -ne 0) { Write-Host 'tauri icon failed' -ForegroundColor Red; exit 1 }
 
+# Rebuild icon.ico full-bleed from logo-app.png so the taskbar icon isn't shrunk
+# by the macOS-style padding tauri icon bakes in. Cosmetic: warn, don't fail.
+# Prefer the `py` launcher (avoids the Windows Store python.exe stub).
+$pyExe = Get-Command py -ErrorAction SilentlyContinue
+if (-not $pyExe) { $pyExe = Get-Command python -ErrorAction SilentlyContinue }
+if ($pyExe) {
+  & $pyExe.Source scripts/build-windows-app-icon.py
+  if ($LASTEXITCODE -ne 0) { Write-Host 'build-windows-app-icon.py failed (taskbar icon may look small)' -ForegroundColor Yellow }
+} else {
+  Write-Host 'python not found; skipping Windows icon.ico rebuild' -ForegroundColor Yellow
+}
+
 # ── Copy assets for Tauri ─────────────────────────────────────
 Write-Step 'Copying assets for Tauri'
 yarn copy:assets:tauri

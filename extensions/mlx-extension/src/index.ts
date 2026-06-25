@@ -366,7 +366,8 @@ export default class mlx_extension extends AIEngine {
 
       const modelConfigPath = await joinPath([currentDir, 'model.yml'])
       if (await fs.existsSync(modelConfigPath)) {
-        modelIds.push(currentDir.slice(modelsDir.length + 1))
+        // Normalize Windows '\' to '/' so the id matches the catalog
+        modelIds.push(currentDir.slice(modelsDir.length + 1).replace(/\\/g, '/'))
         continue
       }
 

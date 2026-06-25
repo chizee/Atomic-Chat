@@ -50,8 +50,20 @@ export function DownloadButtonPlaceholder({
     }))
   )
   const { t } = useTranslation()
-  const getProviderByName = useModelProvider((state) => state.getProviderByName)
-  const llamaProvider = getProviderByName('llamacpp')
+  const providers = useModelProvider((state) => state.providers)
+  // Merge models from BOTH local llama.cpp providers — the turboquant
+  // `llamacpp` fork AND the vanilla `llamacpp-upstream` build. On Windows/Linux
+  // the downloaded model is registered under `llamacpp-upstream` (the default),
+  // so checking only `llamacpp` left the button stuck on "Download".
+  const llamacppModels = useMemo(
+    () =>
+      providers
+        .filter(
+          (p) => p.provider === 'llamacpp' || p.provider === 'llamacpp-upstream'
+        )
+        .flatMap((p) => p.models),
+    [providers]
+  )
 
   const serviceHub = useServiceHub()
   const huggingfaceToken = useGeneralSetting((state) => state.huggingfaceToken)
@@ -68,13 +80,13 @@ export function DownloadButtonPlaceholder({
 
   // Get the actual downloaded model ID (with or without developer prefix)
   const downloadedModelId = useMemo(() => {
-    const foundModel = llamaProvider?.models.find(
+    const foundModel = llamacppModels.find(
       (m: { id: string }) =>
         m.id === modelId ||
         m.id === `${model.developer}/${sanitizeModelId(modelId)}`
     )
     return foundModel?.id || modelId
-  }, [llamaProvider, modelId, model.developer])
+  }, [llamacppModels, modelId, model.developer])
 
   const downloadProcesses = useMemo(
     () =>
@@ -89,13 +101,13 @@ export function DownloadButtonPlaceholder({
   )
 
   useEffect(() => {
-    const isDownloaded = llamaProvider?.models.some(
+    const downloaded = llamacppModels.some(
       (m: { id: string }) =>
         m.id === modelId ||
         m.id === `${model.developer}/${sanitizeModelId(modelId)}`
     )
-    setDownloaded(!!isDownloaded)
-  }, [llamaProvider, modelId, model.developer])
+    setDownloaded((prev) => (prev === downloaded ? prev : downloaded))
+  }, [llamacppModels, modelId, model.developer])
 
   useEffect(() => {
     events.on(

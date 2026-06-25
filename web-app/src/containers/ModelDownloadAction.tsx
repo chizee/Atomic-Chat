@@ -181,10 +181,20 @@ export const ModelDownloadAction = ({
       downloadProcesses.some((e) => e.id === variant.model_id))
   const downloadProgress =
     downloadProcesses.find((e) => e.id === variant.model_id)?.progress || 0
+  // Inspect BOTH local llama.cpp providers — the turboquant `llamacpp` fork
+  // AND the vanilla `llamacpp-upstream` build. On Windows/Linux the downloaded
+  // model is registered under `llamacpp-upstream` (the default), so checking
+  // only `llamacpp` left the button stuck on "Download" (mirrors handleUseModel
+  // and hub/$modelId.tsx, which already consult both).
   const isDownloaded = useModelProvider((state) =>
     state.providers
-      .find((p) => p.provider === 'llamacpp')
-      ?.models.some((m: { id: string }) => m.id === variant.model_id)
+      .filter(
+        (p) =>
+          p.provider === 'llamacpp' || p.provider === 'llamacpp-upstream'
+      )
+      .some((p) =>
+        p.models.some((m: { id: string }) => m.id === variant.model_id)
+      )
   )
 
   if (isDownloading) {
