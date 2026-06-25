@@ -17,6 +17,7 @@ import {
 } from '@tanstack/react-router'
 import { useTranslation } from '@/i18n/react-i18next-compat'
 import Capabilities from '@/containers/Capabilities'
+import { ModelSourceBadge, MissingModelBadge } from '@/components/ModelSourceBadge'
 import { DynamicControllerSetting } from '@/containers/dynamicControllerSetting'
 import { RenderMarkdown } from '@/containers/RenderMarkdown'
 import { DialogEditModel } from '@/containers/dialogs/EditModel'
@@ -2235,6 +2236,12 @@ function ProviderDetail() {
                               >
                                 {getModelDisplayName(model)}
                               </h1>
+                              {model.source && (
+                                <ModelSourceBadge source={model.source} />
+                              )}
+                              {model.missing && (
+                                <MissingModelBadge source={model.source} />
+                              )}
                               <Capabilities capabilities={capabilities} />
                             </div>
                           }

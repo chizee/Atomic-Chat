@@ -9,6 +9,7 @@ import { useModelProvider } from '@/hooks/useModelProvider'
 import { cn, getProviderTitle, getModelDisplayName } from '@/lib/utils'
 import { highlightFzfMatch } from '@/utils/highlight'
 import Capabilities from './Capabilities'
+import { ModelSourceBadge, MissingModelBadge } from '@/components/ModelSourceBadge'
 import { IconSettings, IconX, IconDownload } from '@tabler/icons-react'
 import { useNavigate } from '@tanstack/react-router'
 import { route } from '@/constants/routes'
@@ -581,6 +582,18 @@ const DropdownModelProvider = memo(function DropdownModelProvider({
                             <span className="text-sm truncate">
                               {getModelDisplayName(searchableModel.model)}
                             </span>
+                            {searchableModel.model.source && (
+                              <ModelSourceBadge
+                                source={searchableModel.model.source}
+                                className="shrink-0"
+                              />
+                            )}
+                            {searchableModel.model.missing && (
+                              <MissingModelBadge
+                                source={searchableModel.model.source}
+                                className="shrink-0"
+                              />
+                            )}
                             <div className="flex-1"></div>
                             {capabilities.length > 0 && (
                               <div className="shrink-0 -mr-1.5">
@@ -671,6 +684,18 @@ const DropdownModelProvider = memo(function DropdownModelProvider({
                                 >
                                   {getModelDisplayName(searchableModel.model)}
                                 </span>
+                                {searchableModel.model.source && (
+                                  <ModelSourceBadge
+                                    source={searchableModel.model.source}
+                                    className="shrink-0"
+                                  />
+                                )}
+                                {searchableModel.model.missing && (
+                                  <MissingModelBadge
+                                    source={searchableModel.model.source}
+                                    className="shrink-0"
+                                  />
+                                )}
                                 <div className="flex-1"></div>
                                 {capabilities.length > 0 && (
                                   <div className="shrink-0 -mr-1.5">
