@@ -575,40 +575,131 @@ async fn download_single_file(
     let mut writer = tokio::io::BufWriter::new(file);
     let mut total_transferred = initial_progress;
 
+    // Maximum consecutive retry attempts on transient stream / body errors.
+    // The counter resets to zero after any successfully-received chunk so that
+    // a large download on a flaky connection can self-heal indefinitely as long
+    // as it continues to make forward progress.
+    const MAX_STREAM_RETRIES: u32 = 5;
+    // Base retry delay in milliseconds; doubles on each attempt (1 s → 2 s → 4 s …).
+    const RETRY_BASE_DELAY_MS: u64 = 1_000;
+    let mut retry_count = 0u32;
+
     // write chunk to file
-    while let Some(chunk) = stream.next().await {
-        if cancel_token.is_cancelled() {
-            if !keep_partial_on_cancel && !should_resume {
-                tokio::fs::remove_dir_all(&save_path.parent().unwrap())
-                    .await
-                    .ok();
+    loop {
+        match stream.next().await {
+            None => break, // stream ended normally
+
+            Some(Ok(chunk)) => {
+                // Successful chunk — reset the consecutive-error counter.
+                retry_count = 0;
+
+                if cancel_token.is_cancelled() {
+                    if !keep_partial_on_cancel && !should_resume {
+                        tokio::fs::remove_dir_all(&save_path.parent().unwrap())
+                            .await
+                            .ok();
+                    }
+                    log::info!("Download cancelled: {}", item.url);
+                    return Err("Download cancelled".to_string());
+                }
+
+                writer.write_all(&chunk).await.map_err(err_to_string)?;
+                download_delta += chunk.len() as u64;
+                total_transferred += chunk.len() as u64;
+
+                // Update progress every 10 MB
+                if download_delta >= 10 * 1024 * 1024 {
+                    // Update individual file progress
+                    progress_tracker
+                        .update_progress(&file_id, total_transferred)
+                        .await;
+
+                    // Emit combined progress event
+                    let (combined_transferred, combined_total) =
+                        progress_tracker.get_total_progress().await;
+                    let evt = DownloadEvent {
+                        transferred: combined_transferred,
+                        total: combined_total,
+                    };
+                    app.emit(&evt_name, evt).unwrap();
+
+                    download_delta = 0u64;
+                }
             }
-            log::info!("Download cancelled: {}", item.url);
-            return Err("Download cancelled".to_string());
-        }
 
-        let chunk = chunk.map_err(err_to_string)?;
-        writer.write_all(&chunk).await.map_err(err_to_string)?;
-        download_delta += chunk.len() as u64;
-        total_transferred += chunk.len() as u64;
+            Some(Err(e)) => {
+                // Transient body / stream error (e.g. "end of file before
+                // message length reached").  Attempt to resume from the
+                // current offset rather than failing immediately.
+                if retry_count >= MAX_STREAM_RETRIES {
+                    return Err(format!(
+                        "Download failed after {MAX_STREAM_RETRIES} retries: {e}"
+                    ));
+                }
 
-        // Update progress every 10 MB
-        if download_delta >= 10 * 1024 * 1024 {
-            // Update individual file progress
-            progress_tracker
-                .update_progress(&file_id, total_transferred)
-                .await;
+                if cancel_token.is_cancelled() {
+                    return Err("Download cancelled".to_string());
+                }
 
-            // Emit combined progress event
-            let (combined_transferred, combined_total) =
-                progress_tracker.get_total_progress().await;
-            let evt = DownloadEvent {
-                transferred: combined_transferred,
-                total: combined_total,
-            };
-            app.emit(&evt_name, evt).unwrap();
+                // Flush bytes written so far before the reconnect so they are
+                // safely on disk regardless of the buffering state.
+                if let Err(flush_err) = writer.flush().await {
+                    log::warn!(
+                        "Failed to flush during retry for '{}': {flush_err}",
+                        item.url
+                    );
+                }
 
-            download_delta = 0u64;
+                let delay_ms = RETRY_BASE_DELAY_MS * (1u64 << retry_count.min(6));
+                log::warn!(
+                    "Stream error at byte {} for '{}': {}. \
+                     Retry {}/{} after {}ms",
+                    total_transferred,
+                    item.url,
+                    e,
+                    retry_count + 1,
+                    MAX_STREAM_RETRIES,
+                    delay_ms
+                );
+
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+
+                if cancel_token.is_cancelled() {
+                    return Err("Download cancelled".to_string());
+                }
+
+                // Try to reopen the connection from the current byte offset
+                // using an HTTP Range request.  If the server does not honour
+                // ranges (no 206 response), fall back to a complete
+                // re-download and reset the file.
+                let new_resp = if total_transferred > 0 {
+                    match _get_maybe_resume_internal(&client, &item.url, total_transferred).await {
+                        Ok(resp) => resp,
+                        Err(range_err) => {
+                            log::warn!(
+                                "Range-resume at byte {} failed ({}); \
+                                 falling back to full re-download of '{}'",
+                                total_transferred,
+                                range_err,
+                                item.url
+                            );
+                            // Truncate and restart the temporary file.
+                            let new_file =
+                                File::create(&tmp_save_path).await.map_err(err_to_string)?;
+                            writer = tokio::io::BufWriter::new(new_file);
+                            progress_tracker.update_progress(&file_id, 0).await;
+                            total_transferred = 0;
+                            download_delta = 0;
+                            _get_maybe_resume_internal(&client, &item.url, 0).await?
+                        }
+                    }
+                } else {
+                    _get_maybe_resume_internal(&client, &item.url, 0).await?
+                };
+
+                stream = new_resp.bytes_stream();
+                retry_count += 1;
+            }
         }
     }
 
