@@ -1,0 +1,18 @@
+name: Notify Cursor on new issue
+
+on:
+  issues:
+    types: [opened]
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: POST to Cursor automation webhook
+        env:
+          CURSOR_WEBHOOK_URL: ${{ secrets.CURSOR_WEBHOOK_URL }}
+          ISSUE_PAYLOAD: ${{ toJSON(github.event.issue) }}
+        run: |
+          curl -sS -X POST "$CURSOR_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "$ISSUE_PAYLOAD"
