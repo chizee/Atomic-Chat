@@ -2271,7 +2271,7 @@ function ProviderDetail() {
                           title={
                             <div className="flex items-center gap-2">
                               <h1
-                                className="font-medium line-clamp-1"
+                                className="font-medium line-clamp-1 max-w-[16rem] lg:max-w-[24rem] xl:max-w-none"
                                 title={model.id}
                               >
                                 {getModelDisplayName(model)}
