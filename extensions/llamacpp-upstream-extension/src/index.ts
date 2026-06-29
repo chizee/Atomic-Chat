@@ -147,6 +147,12 @@ const ERR_MODEL_FILE_CORRUPT = 'MODEL_FILE_CORRUPT'
 const MULTIMODAL_DISABLED_FALLBACK =
   'local_backend://multimodal_disabled_fallback'
 
+/// Tauri event emitted by the Rust watcher task when a llama-server child
+/// process (PID tracked in LlamacppState::process_map) that was running a
+/// loaded model exits unexpectedly during generation (ATO-244).
+/// Payload: `{ model_id: string, pid: number, error_code: string, message: string }`.
+const SESSION_DIED_EVENT = 'local_backend://llamacpp_upstream_session_died'
+
 /// MODEL_LOAD_TIMED_OUT (ATO-188): large models on slow / cold storage can take
 /// longer than the configured connection timeout (default 600s) to finish
 /// loading and report "ready", so the load was cut off at 600s with a raw
@@ -386,6 +392,7 @@ export default class llamacpp_upstream_extension extends AIEngine {
   private modelMaxCtxTrain = new Map<string, number>()
   private unlistenValidationStarted?: () => void
   private unlistenAutoIncreaseCtx?: () => void
+  private unlistenSessionDied?: () => void
 
   override async onLoad(): Promise<void> {
     super.onLoad() // Calls registerEngine() from AIEngine
@@ -540,6 +547,21 @@ export default class llamacpp_upstream_extension extends AIEngine {
         void this.handleAutoIncreaseCtx(event.payload)
       }
     )
+
+    // ATO-244: Rust post-load watcher task emits this event when a
+    // llama-server child that was running (model already loaded) exits
+    // unexpectedly during generation (e.g. Vulkan GPU crash / SIGSEGV).
+    // Clean up internal session state so the extension stays consistent,
+    // then re-emit the event on the Tauri bus for the web-app to pick up
+    // and show an actionable toast.
+    this.unlistenSessionDied = await listen<{
+      model_id: string
+      pid: number
+      error_code: string
+      message: string
+    }>(SESSION_DIED_EVENT, (event) => {
+      void this.handleSessionDied(event.payload)
+    })
 
     //* configureBackends может долго качать движок — не await, иначе весь UI ждёт завершения.
     this.configureBackendsPromise = this.configureBackends()
@@ -2203,6 +2225,9 @@ export default class llamacpp_upstream_extension extends AIEngine {
     }
     if (this.unlistenAutoIncreaseCtx) {
       this.unlistenAutoIncreaseCtx()
+    }
+    if (this.unlistenSessionDied) {
+      this.unlistenSessionDied()
     }
   }
 
@@ -3957,6 +3982,58 @@ export default class llamacpp_upstream_extension extends AIEngine {
 
   /// Bridge from the Local API Server proxy (Rust) back to the extension
   /// when a forwarded request exhausts the model's context window. We
+  /// Handle an unexpected llama-server process exit that happened AFTER the
+  /// model had finished loading (i.e. during active generation). The Rust
+  /// post-load watcher task emits `SESSION_DIED_EVENT` and has already
+  /// removed the session entry from the Rust `process_map`.
+  ///
+  /// Responsibilities here:
+  ///  1. Clean up extension-level state (sessionCache, modelCtxSize) so
+  ///     the extension does not believe the model is still loaded.
+  ///  2. Attempt `this.unload()` for any remaining state cleanup (it will
+  ///     succeed even if the process is already gone — Rust returns "not
+  ///     found → success" in that case).
+  ///  3. Re-emit the event on the Tauri bus so that `DataProvider.tsx` in
+  ///     the web-app can show an actionable crash toast to the user.
+  private async handleSessionDied(payload: {
+    model_id: string
+    pid: number
+    error_code: string
+    message: string
+  }): Promise<void> {
+    const { model_id, error_code, message } = payload
+    logger.warn(
+      `[sessionDied] llamacpp-upstream: model='${model_id}' crashed during generation ` +
+        `(code=${error_code}): ${message}`
+    )
+
+    // Best-effort unload first — it will look up the session in sessionCache,
+    // call Rust's unload (a no-op there since the watcher already removed the
+    // entry from process_map, which returns success), and then clean up
+    // sessionCache itself.
+    try {
+      await this.unload(model_id)
+    } catch (e) {
+      // Expected when the watcher already removed the entry from both the Rust
+      // process_map and sessionCache has no entry. Manually clean up.
+      this.sessionCache.delete(model_id)
+      logger.warn(`[sessionDied] unload for '${model_id}' was a no-op (already cleaned): ${e}`)
+    }
+
+    // modelCtxSize is not touched by unload(); clear it here.
+    this.modelCtxSize.delete(model_id)
+    // Keep modelMaxCtxTrain — it's read from the GGUF header and doesn't change.
+
+    // Forward the event on the Tauri bus so DataProvider.tsx can show a toast.
+    // The Rust watcher already emitted this event; re-emitting from the
+    // extension ensures it reaches the web-app even if the Rust side races.
+    try {
+      await tauriEmit(SESSION_DIED_EVENT, payload)
+    } catch (e) {
+      logger.warn(`[sessionDied] failed to re-emit ${SESSION_DIED_EVENT}: ${e}`)
+    }
+  }
+
   /// unload + reload the model with a larger ctx_size, inform the proxy via
   /// a request-scoped done event, and notify the web-app UI so the Zustand
   /// provider store mirrors the new value (so the next UI interaction keeps

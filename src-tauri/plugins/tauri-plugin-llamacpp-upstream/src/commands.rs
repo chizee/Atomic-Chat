@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
-use tauri::{Manager, Runtime, State};
+use tauri::{Emitter, Manager, Runtime, State};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{mpsc, Mutex};
@@ -284,6 +284,11 @@ pub async fn load_llama_model_impl(
     Ok(session_info)
 }
 
+/// Tauri event emitted when a llama-server child process that was running
+/// (i.e. had already loaded a model) exits unexpectedly during generation.
+/// Payload: `{ model_id, pid, error_code, message }`.
+pub const SESSION_DIED_EVENT: &str = "local_backend://llamacpp_upstream_session_died";
+
 /// Load a llama model and start the server
 #[tauri::command]
 pub async fn load_llama_model<R: Runtime>(
@@ -299,7 +304,7 @@ pub async fn load_llama_model<R: Runtime>(
     timeout: u64,
 ) -> ServerResult<SessionInfo> {
     let state: State<LlamacppState> = app_handle.state();
-    load_llama_model_impl(
+    let session_info = load_llama_model_impl(
         state.llama_server_process.clone(),
         backend_path,
         model_id,
@@ -311,7 +316,107 @@ pub async fn load_llama_model<R: Runtime>(
         is_embedding,
         timeout,
     )
-    .await
+    .await?;
+
+    // Spawn a background watcher task that detects unexpected process exits
+    // (crashes during generation). Without this watcher, a Vulkan or other
+    // backend crash that happens AFTER the model loads is invisible: no exit
+    // code is classified, no Sentry event fires, and the user only sees a
+    // broken HTTP stream with no actionable message.
+    //
+    // The watcher polls `try_wait()` (non-blocking) on the child every 500 ms.
+    // When the process exits unexpectedly it:
+    //   1. Removes the session from the process_map (so unload is a no-op).
+    //   2. Classifies the exit via `from_exit_status` (SIGSEGV/SIGABRT etc.).
+    //   3. Logs at `error!` so the Sentry logger bridge forwards it as a crash event.
+    //   4. Emits `SESSION_DIED_EVENT` so the extension and web-app can surface
+    //      an actionable "model crashed during generation" message.
+    //
+    // Intentional unloads are transparent: `unload_llama_model` removes the
+    // entry from the map, so the watcher finds `None` on its next poll and exits.
+    let pid = session_info.pid;
+    let process_map_watcher = state.llama_server_process.clone();
+    let app_handle_watcher = app_handle.clone();
+    tokio::spawn(async move {
+        const POLL_INTERVAL: Duration = Duration::from_millis(500);
+        loop {
+            tokio::time::sleep(POLL_INTERVAL).await;
+
+            // Scope the lock acquisition tightly so we do not hold it across
+            // the sleep. try_wait() is synchronous and non-blocking.
+            let poll_outcome: Result<Option<(std::process::ExitStatus, SessionInfo)>, ()> = {
+                let mut map = process_map_watcher.lock().await;
+                match map.get_mut(&pid) {
+                    None => Err(()), // Session intentionally removed by unload
+                    Some(session) => {
+                        match session.child.try_wait() {
+                            Ok(None) => Ok(None), // Still running
+                            Ok(Some(status)) => {
+                                let info = session.info.clone();
+                                // Remove from map so subsequent unload calls are no-ops
+                                map.remove(&pid);
+                                Ok(Some((status, info)))
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "llamacpp-upstream watcher: try_wait error for PID {}: {}",
+                                    pid,
+                                    e
+                                );
+                                Err(())
+                            }
+                        }
+                    }
+                }
+            }; // lock released here
+
+            match poll_outcome {
+                Ok(None) => {} // Still running — continue polling
+                Err(()) => break,
+                Ok(Some((status, info))) => {
+                    // Unexpected exit: classify and report.
+                    let error = LlamacppError::from_exit_status(&status, "");
+                    // log::error! → Sentry logger bridge (ATO-244: generation-time
+                    // crashes were previously invisible to Sentry because the
+                    // classification path was only wired to the load path).
+                    log::error!(
+                        "llamacpp-upstream: llama-server (PID {}, model='{}') exited \
+                         unexpectedly during generation — code={:?} — {}",
+                        pid,
+                        info.model_id,
+                        status.code(),
+                        error.message
+                    );
+
+                    #[derive(serde::Serialize)]
+                    struct SessionDiedPayload {
+                        model_id: String,
+                        pid: i32,
+                        error_code: String,
+                        message: String,
+                    }
+                    let payload = SessionDiedPayload {
+                        model_id: info.model_id.clone(),
+                        pid: info.pid,
+                        error_code: format!("{:?}", error.code),
+                        message: error.message.clone(),
+                    };
+                    if let Err(e) =
+                        app_handle_watcher.emit(SESSION_DIED_EVENT, &payload)
+                    {
+                        log::warn!(
+                            "llamacpp-upstream watcher: failed to emit {} event: {}",
+                            SESSION_DIED_EVENT,
+                            e
+                        );
+                    }
+                    break;
+                }
+            }
+        }
+    });
+
+    Ok(session_info)
 }
 
 /// Unload a llama model by terminating its process
