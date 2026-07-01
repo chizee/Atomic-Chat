@@ -184,6 +184,18 @@ export const INTEGRATION_AGENTS: IntegrationAgent[] = [
     endpointWithPrefix: true,
   },
   {
+    id: 'poolside',
+    name: 'Poolside',
+    description: 'Coding agent CLI with standalone mode.',
+    kind: 'coding',
+    detectBin: 'pool',
+    docsUrl: 'https://docs.poolside.ai/cli',
+    installable: true,
+    configurable: true,
+    requiresModel: true,
+    endpointWithPrefix: true,
+  },
+  {
     id: 'goose',
     name: 'Goose',
     description: "Block's open-source AI agent that runs, edits, and tests code.",

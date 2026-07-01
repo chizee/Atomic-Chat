@@ -1693,6 +1693,33 @@ fn agent_install_spec(
             let prereq = if cfg!(windows) { "powershell" } else { "curl" };
             Ok((program, args, prereq, "https://github.com/NousResearch/hermes-agent"))
         }
+        "poolside" => {
+            // Poolside ships via an official shell / PowerShell bootstrap script.
+            // `POOL_INSTALL_ACCEPT_EULA=1` skips the interactive EULA prompt so
+            // the installer doesn't hang reading from /dev/tty when spawned from
+            // the app — we write the agent's config ourselves via
+            // `configure_poolside`.
+            let (program, args): (String, Vec<String>) = if cfg!(windows) {
+                (
+                    "powershell".to_string(),
+                    vec![
+                        "-NoProfile".to_string(),
+                        "-Command".to_string(),
+                        "$env:POOL_INSTALL_ACCEPT_EULA='1'; irm https://downloads.poolside.ai/pool/install.ps1 | iex".to_string(),
+                    ],
+                )
+            } else {
+                (
+                    "sh".to_string(),
+                    vec![
+                        "-c".to_string(),
+                        "POOL_INSTALL_ACCEPT_EULA=1 curl -fsSL https://downloads.poolside.ai/pool/install.sh | sh".to_string(),
+                    ],
+                )
+            };
+            let prereq = if cfg!(windows) { "powershell" } else { "curl" };
+            Ok((program, args, prereq, "https://docs.poolside.ai/cli"))
+        }
         "zed" => {
             // Zed ships its own installer (NOT npm). On macOS/Linux the official
             // shell script downloads the editor and drops a `zed` CLI shim on
@@ -3458,6 +3485,76 @@ pub fn configure_kilo(
     std::fs::write(&path, pretty + "\n")
         .map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
     log::info!("KiloCode configured: baseURL={}, model={}", api_url, model);
+    Ok(())
+}
+
+/// Poolside standalone mode expects a base URL WITHOUT the `/v1` suffix.
+fn poolside_standalone_base_url(api_url: &str) -> String {
+    let trimmed = api_url.trim().trim_end_matches('/');
+    trimmed
+        .strip_suffix("/v1")
+        .unwrap_or(trimmed)
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// Configure Poolside CLI via its standalone OpenAI-compatible environment
+/// variables. Poolside has no provider config file for BYOK — it reads
+/// `POOLSIDE_STANDALONE_*` from the environment at launch — so we persist them
+/// to the user's shell rc (Windows: `setx`). The auto-opened terminal also
+/// passes them inline so the session works without re-sourcing the rc file.
+#[tauri::command]
+pub fn configure_poolside(
+    api_url: String,
+    model: String,
+    api_key: Option<String>,
+) -> Result<(), String> {
+    let key_val = api_key
+        .as_deref()
+        .filter(|k| !k.is_empty())
+        .unwrap_or("atomic");
+    let standalone_base = poolside_standalone_base_url(&api_url);
+
+    let mut env_vars: Vec<(String, String)> = Vec::with_capacity(3);
+    env_vars.push((
+        "POOLSIDE_STANDALONE_BASE_URL".to_string(),
+        standalone_base.clone(),
+    ));
+    env_vars.push(("POOLSIDE_API_KEY".to_string(), key_val.to_string()));
+    env_vars.push(("POOLSIDE_STANDALONE_MODEL".to_string(), model.clone()));
+
+    const MARKER: &str = "# Atomic Chat - Poolside Config";
+
+    if cfg!(target_os = "windows") {
+        for (key, value) in &env_vars {
+            let output = std::process::Command::new("setx")
+                .arg(key)
+                .arg(value)
+                .output()
+                .map_err(|e| e.to_string())?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(format!("Failed to set env var {}: {}", key, stderr));
+            }
+        }
+        log::info!(
+            "Poolside configured (Windows env): base_url={}, model={}",
+            standalone_base,
+            model
+        );
+        return Ok(());
+    }
+
+    let home = agent_home_dir()?;
+    let is_macos = cfg!(target_os = "macos");
+    let (_shell, env_file_path) = detect_shell_env_file(&home, is_macos);
+    write_marked_env_to_shell(&env_file_path, MARKER, "POOLSIDE_", &env_vars)?;
+    log::info!(
+        "Poolside configured: base_url={}, model={}, rc={}",
+        standalone_base,
+        model,
+        env_file_path
+    );
     Ok(())
 }
 

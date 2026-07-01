@@ -155,6 +155,7 @@ pub fn run() {
         core::system::commands::configure_goose,
         core::system::commands::configure_openhands,
         core::system::commands::configure_kilo,
+        core::system::commands::configure_poolside,
         core::system::commands::open_agent_terminal,
         core::system::commands::launch_editor,
         // Server commands
@@ -274,6 +275,7 @@ pub fn run() {
         core::system::commands::configure_goose,
         core::system::commands::configure_openhands,
         core::system::commands::configure_kilo,
+        core::system::commands::configure_poolside,
         core::system::commands::open_agent_terminal,
         core::system::commands::launch_editor,
         // Server commands
