@@ -986,13 +986,7 @@ pub fn configure_hermes_agent(
     api_key: Option<String>,
     context_length: Option<u32>,
 ) -> Result<(), String> {
-    let home_dir = if cfg!(windows) {
-        std::env::var("USERPROFILE").map_err(|e| e.to_string())?
-    } else {
-        std::env::var("HOME").map_err(|e| e.to_string())?
-    };
-
-    let hermes_dir = std::path::PathBuf::from(&home_dir).join(".hermes");
+    let hermes_dir = resolve_hermes_dir()?;
     let config_path = hermes_dir.join("config.yaml");
     let env_path = hermes_dir.join(".env");
 
@@ -1001,7 +995,7 @@ pub fn configure_hermes_agent(
     // logic below has the anchors it expects, instead of failing outright.
     if !config_path.exists() {
         std::fs::create_dir_all(&hermes_dir)
-            .map_err(|e| format!("Failed to create ~/.hermes directory: {}", e))?;
+            .map_err(|e| format!("Failed to create Hermes home directory: {}", e))?;
         std::fs::write(&config_path, HERMES_DEFAULT_CONFIG)
             .map_err(|e| format!("Failed to create config.yaml: {}", e))?;
     }
@@ -1097,13 +1091,7 @@ pub fn configure_hermes_agent(
 
 #[tauri::command]
 pub fn clear_hermes_agent_config() -> Result<(), String> {
-    let home_dir = if cfg!(windows) {
-        std::env::var("USERPROFILE").map_err(|e| e.to_string())?
-    } else {
-        std::env::var("HOME").map_err(|e| e.to_string())?
-    };
-
-    let hermes_dir = std::path::PathBuf::from(&home_dir).join(".hermes");
+    let hermes_dir = resolve_hermes_dir()?;
     let config_path = hermes_dir.join("config.yaml");
 
     if !config_path.exists() {
@@ -1211,6 +1199,71 @@ const HERMES_DEFAULT_CONFIG: &str = "model:
   base_url: https://openrouter.ai/api/v1
 custom_providers: []
 ";
+
+/// Resolve the Hermes Agent home directory, mirroring the resolution order of
+/// Hermes' own `hermes_constants.py::get_hermes_home()`: an explicit
+/// `HERMES_HOME` env var wins, else the platform-native default
+/// (`%LOCALAPPDATA%\hermes` on Windows, `~/.hermes` elsewhere).
+///
+/// On Windows the native installer (`install.ps1`) sets `HERMES_HOME` via
+/// `[Environment]::SetEnvironmentVariable(..., "User")` -- a registry write
+/// that is invisible to Atomic Chat's own already-running process (which only
+/// sees the environment block snapshotted at its own startup). So
+/// `std::env::var("HERMES_HOME")` can be stale within the same app session
+/// that just installed Hermes. Reading the registry value directly first
+/// (mirroring Hermes' own official desktop app, which hit and fixed this
+/// exact gap) avoids ever writing to a config file the `hermes` CLI won't
+/// read.
+fn resolve_hermes_dir() -> Result<std::path::PathBuf, String> {
+    if cfg!(windows) {
+        if let Some(home) = read_windows_user_env("HERMES_HOME").filter(|s| !s.is_empty()) {
+            return Ok(std::path::PathBuf::from(home));
+        }
+        if let Ok(home) = std::env::var("HERMES_HOME") {
+            if !home.is_empty() {
+                return Ok(std::path::PathBuf::from(home));
+            }
+        }
+        let local_appdata = std::env::var("LOCALAPPDATA").map_err(|e| e.to_string())?;
+        Ok(std::path::PathBuf::from(local_appdata).join("hermes"))
+    } else {
+        let home_dir = std::env::var("HOME").map_err(|e| e.to_string())?;
+        Ok(std::path::PathBuf::from(home_dir).join(".hermes"))
+    }
+}
+
+/// Read a single User-scope Windows environment variable fresh from the
+/// registry (`HKCU\Environment`), bypassing the current process's stale
+/// environment-block snapshot. Returns `None` off Windows, on read failure,
+/// or when the value is empty/absent.
+#[cfg(windows)]
+fn read_windows_user_env(name: &str) -> Option<String> {
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+
+    let mut cmd = Command::new("powershell");
+    cmd.args([
+        "-NoProfile",
+        "-Command",
+        &format!("[Environment]::GetEnvironmentVariable('{}', 'User')", name),
+    ]);
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+#[cfg(not(windows))]
+fn read_windows_user_env(_name: &str) -> Option<String> {
+    None
+}
 
 /// Split the config into (before, entries, after) around `custom_providers:`.
 /// `entries` is a Vec of Vec<String>, one per YAML list item.
