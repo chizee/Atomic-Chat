@@ -754,6 +754,7 @@ export class ModelFactory {
       case 'openrouter':
       case 'huggingface':
       case 'nvidia':
+      case 'ollama':
         return this.createOpenAICompatibleModel(modelId, provider, override)
 
       case 'xai':

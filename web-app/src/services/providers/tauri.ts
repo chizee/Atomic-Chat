@@ -9,8 +9,60 @@ import { ModelCapabilities } from '@/types/models'
 import { modelSettings } from '@/lib/predefined'
 import { ExtensionManager } from '@/lib/extension'
 import { fetch as fetchTauri } from '@tauri-apps/plugin-http'
+import { invoke } from '@tauri-apps/api/core'
 import { DefaultProvidersService } from './default'
 import { getModelCapabilities } from '@/lib/models'
+import { isLoopbackUrl } from '@/utils/registerRemoteProvider'
+
+/**
+ * Extract model ids from the parsed body of a `/models` endpoint. Handles the
+ * OpenAI shape (`{ data: [{ id }] }`), a bare array, and `{ models: [...] }`.
+ */
+function extractModelIds(rawText: string, providerLabel: string): string[] {
+  let data: unknown
+  try {
+    data = JSON.parse(rawText) as unknown
+  } catch (err) {
+    throw new Error(
+      `Failed to parse JSON response from ${providerLabel}: ${err instanceof Error ? err.message : String(err)}`
+    )
+  }
+
+  const obj =
+    data && typeof data === 'object'
+      ? (data as Record<string, unknown>)
+      : null
+
+  if (obj && Array.isArray(obj.data)) {
+    return (obj.data as Array<{ id?: string }>)
+      .map((model) => model?.id ?? '')
+      .filter(Boolean)
+  }
+  if (Array.isArray(data)) {
+    return (data as Array<unknown>)
+      .map((model) =>
+        typeof model === 'string'
+          ? model
+          : model && typeof model === 'object' && 'id' in model
+            ? String((model as { id?: unknown }).id ?? '')
+            : ''
+      )
+      .filter(Boolean)
+  }
+  if (obj && Array.isArray(obj.models)) {
+    return (obj.models as Array<unknown>)
+      .map((model) =>
+        typeof model === 'string'
+          ? model
+          : model && typeof model === 'object' && 'id' in model
+            ? String((model as { id?: unknown }).id ?? '')
+            : ''
+      )
+      .filter(Boolean)
+  }
+  console.warn('Unexpected response format from provider API:', data)
+  return []
+}
 
 export class TauriProvidersService extends DefaultProvidersService {
   fetch(): typeof fetch {
@@ -199,6 +251,39 @@ export class TauriProvidersService extends DefaultProvidersService {
       })
     }
 
+    // Loopback providers (Ollama, LM Studio, …) go through a Rust `reqwest`
+    // command instead of the Tauri HTTP plugin, whose webview body-streaming
+    // has been observed to hang reading small local responses (e.g. Ollama's
+    // /v1/models returns instantly to curl but times out via the plugin).
+    if (isLoopbackUrl(provider.base_url)) {
+      const urls = fallbackUrl ? [primaryUrl, fallbackUrl] : [primaryUrl]
+      let lastError: unknown
+      for (const url of urls) {
+        try {
+          const rawText = await invoke<string>('get_local_http', {
+            url,
+            headers,
+            timeoutSecs: 30,
+          })
+          const ids = extractModelIds(rawText, provider.provider)
+          console.info(
+            `[providers:${provider.provider}] parsed ${ids.length} model ids (url=${url})`
+          )
+          return ids
+        } catch (err) {
+          lastError = err
+          const msg = err instanceof Error ? err.message : String(err)
+          // Only fall through to /v1/models on a 404; other errors are terminal.
+          if (!msg.startsWith('HTTP 404')) break
+        }
+      }
+      const msg =
+        lastError instanceof Error ? lastError.message : String(lastError)
+      throw new Error(
+        `Cannot fetch models from ${provider.provider} at ${baseUrl}: ${msg}`
+      )
+    }
+
     // Hard timeout: the Tauri HTTP plugin does not always honour
     // AbortSignal on macOS, so we race the request against a manual timer.
     // 30s accommodates slow providers (OpenRouter's /models has been
@@ -333,56 +418,7 @@ export class TauriProvidersService extends DefaultProvidersService {
         `[providers:${provider.provider}] body received (${rawText.length} bytes, url=${usedUrl})`
       )
 
-      let data: unknown
-      try {
-        data = JSON.parse(rawText) as unknown
-      } catch (err) {
-        throw new Error(
-          `Failed to parse JSON response from ${provider.provider}: ${err instanceof Error ? err.message : String(err)}`
-        )
-      }
-
-      // Handle different response formats that providers might use.
-      const obj =
-        data && typeof data === 'object'
-          ? (data as Record<string, unknown>)
-          : null
-
-      const collected: string[] = (() => {
-        if (obj && Array.isArray(obj.data)) {
-          // OpenAI format: { data: [{ id: "model-id" }, ...] }
-          return (obj.data as Array<{ id?: string }>)
-            .map((model) => model?.id ?? '')
-            .filter(Boolean)
-        }
-        if (Array.isArray(data)) {
-          // Direct array format: ["model-id1", "model-id2", ...]
-          return (data as Array<unknown>)
-            .map((model) =>
-              typeof model === 'string'
-                ? model
-                : model && typeof model === 'object' && 'id' in model
-                  ? String((model as { id?: unknown }).id ?? '')
-                  : ''
-            )
-            .filter(Boolean)
-        }
-        if (obj && Array.isArray(obj.models)) {
-          // Alternative format: { models: [...] }
-          return (obj.models as Array<unknown>)
-            .map((model) =>
-              typeof model === 'string'
-                ? model
-                : model && typeof model === 'object' && 'id' in model
-                  ? String((model as { id?: unknown }).id ?? '')
-                  : ''
-            )
-            .filter(Boolean)
-        }
-        console.warn('Unexpected response format from provider API:', data)
-        return []
-      })()
-
+      const collected = extractModelIds(rawText, provider.provider)
       console.info(
         `[providers:${provider.provider}] parsed ${collected.length} model ids`
       )

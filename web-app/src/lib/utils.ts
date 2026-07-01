@@ -109,6 +109,8 @@ export function getProviderLogo(provider: string) {
       return '/images/model-provider/moonshot.svg'
     case 'qwen':
       return '/images/model-provider/qwen.svg'
+    case 'ollama':
+      return '/images/model-provider/ollama.svg'
     default:
       return undefined
   }
@@ -181,6 +183,8 @@ export const getProviderTitle = (provider: string) => {
       return 'Moonshot'
     case 'qwen':
       return 'Qwen'
+    case 'ollama':
+      return 'Ollama'
     default:
       return provider.charAt(0).toUpperCase() + provider.slice(1)
   }

@@ -31,6 +31,7 @@ import {
   type AtomicChatDeepLinkTarget,
 } from '@/services/deeplink/parse'
 import {
+  isKeylessRemoteProvider,
   isLocalProvider,
   registerRemoteProvider,
   unregisterRemoteProvider,
@@ -64,7 +65,7 @@ const syncRemoteProviders = () => {
     if (
       provider.active &&
       !isLocalProvider(provider.provider) &&
-      provider.api_key
+      (provider.api_key || isKeylessRemoteProvider(provider))
     ) {
       safeRegisterRemoteProvider(provider)
       currentActive.add(provider.provider)
@@ -722,7 +723,11 @@ export function DataProvider() {
         // Cloud provider without an API key cannot be registered with the
         // proxy, so we just bring the server up bare and leave the UI to
         // show "no active model". The user must add an API key in Settings.
-        if (isCloud && !candidateProvider?.api_key) {
+        if (
+          isCloud &&
+          !candidateProvider?.api_key &&
+          !isKeylessRemoteProvider(candidateProvider)
+        ) {
           console.log(
             '[LocalAPI:startup] Cloud provider selected without API key, raising bare server:',
             modelToStart.provider

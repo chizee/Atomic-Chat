@@ -7,7 +7,10 @@ import { useThreads } from '@/hooks/useThreads'
 import { localStorageKey } from '@/constants/localStorage'
 import i18n from '@/i18n/setup'
 import type { ServiceHub } from '@/services'
-import { registerRemoteProvider } from '@/utils/registerRemoteProvider'
+import {
+  isKeylessRemoteProvider,
+  registerRemoteProvider,
+} from '@/utils/registerRemoteProvider'
 import { syncActiveModelsFromEngines } from '@/utils/activeModelsSync'
 import posthog from 'posthog-js'
 import {
@@ -421,7 +424,7 @@ async function doSwitchToModel(params: {
     } else {
       // 4b. Cloud branch — register the provider so the proxy can route
       //     requests for `modelId` to provider.base_url.
-      if (!provider.api_key) {
+      if (!provider.api_key && !isKeylessRemoteProvider(provider)) {
         throw new Error(
           `Provider '${providerName}' has no API key. Add one in Settings before selecting this model.`
         )

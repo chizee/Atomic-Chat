@@ -197,6 +197,7 @@ pub fn run() {
         core::updater::commands::is_update_available,
         // HTTP (bypasses tauri_plugin_http fetch interception)
         core::http::post_local_http,
+        core::http::get_local_http,
         core::http::stream_local_http,
         // HTML artifact preview (served via the artifact:// protocol)
         core::artifact::set_artifact_html,

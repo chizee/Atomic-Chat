@@ -41,7 +41,9 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import {
+  isKeylessRemoteProvider,
   isLocalProvider,
+  isLoopbackUrl,
   unregisterRemoteProvider,
 } from '@/utils/registerRemoteProvider'
 import { syncActiveModelsFromEngines } from '@/utils/activeModelsSync'
@@ -523,6 +525,64 @@ function ProviderDetail() {
 
   // Note: settingsChanged event is now handled globally in GlobalEventHandler
   // This ensures all screens receive the event intermediately
+
+  // Auto-load models for loopback providers (Ollama, LM Studio, …) on entry.
+  // Their catalog is dynamic — whatever the user has pulled locally — so we
+  // silently probe /v1/models when the page opens instead of forcing a manual
+  // Refresh. Runs once per navigation into the provider; errors are non-fatal
+  // and the manual Refresh button remains available.
+  useEffect(() => {
+    const prov = useModelProvider.getState().getProviderByName(providerName)
+    if (
+      !prov ||
+      isLocalProvider(prov.provider) ||
+      !prov.base_url ||
+      !isLoopbackUrl(prov.base_url)
+    ) {
+      return
+    }
+
+    let cancelled = false
+    const load = async () => {
+      setRefreshingModels(true)
+      try {
+        const liveIds = await serviceHub
+          .providers()
+          .fetchModelsFromProvider(prov)
+        if (cancelled) return
+
+        const existing = new Set(prov.models.map((m) => m.id))
+        const newModels = liveIds
+          .filter((id) => !existing.has(id))
+          .map((id) => ({
+            id,
+            model: id,
+            name: id,
+            capabilities: getModelCapabilities(prov.provider, id),
+            version: '1.0',
+          }))
+
+        if (newModels.length > 0) {
+          updateProvider(prov.provider, {
+            ...prov,
+            models: [...prov.models, ...newModels],
+          })
+        }
+      } catch (err) {
+        console.warn(
+          `[providers:${providerName}] auto model load failed (non-fatal):`,
+          err
+        )
+      } finally {
+        if (!cancelled) setRefreshingModels(false)
+      }
+    }
+
+    void load()
+    return () => {
+      cancelled = true
+    }
+  }, [providerName, serviceHub, updateProvider])
 
   const handleRefreshModels = async () => {
     if (!provider) return
@@ -2342,7 +2402,8 @@ function ProviderDetail() {
                                   // proxy). Local engines don't.
                                   const needsApiKey =
                                     !isLocalProvider(provider.provider) &&
-                                    !provider.api_key
+                                    !provider.api_key &&
+                                    !isKeylessRemoteProvider(provider)
                                   const isActive = activeModels.some(
                                     (activeModel) => activeModel === model.id
                                   )
