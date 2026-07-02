@@ -1697,8 +1697,21 @@ fn agent_install_spec(
             // Poolside ships via an official shell / PowerShell bootstrap script.
             // `POOL_INSTALL_ACCEPT_EULA=1` skips the interactive EULA prompt so
             // the installer doesn't hang reading from /dev/tty when spawned from
-            // the app — we write the agent's config ourselves via
-            // `configure_poolside`.
+            // the app, and `POOL_INSTALL_UPDATE_PATH=1` makes it drop the `pool`
+            // binary onto PATH (via the user's shell rc) instead of the default
+            // `ask` mode, which no-ops when there's no TTY — otherwise `pool`
+            // installs to ~/.local/bin but stays undetectable. We still write the
+            // agent's config ourselves via `configure_poolside`.
+            //
+            // On the Unix side the env vars MUST sit on the `sh` that actually
+            // runs the piped script, NOT on the leading `curl`: in
+            // `VAR=1 curl ... | sh` the assignment applies only to curl's
+            // environment and the downstream `sh` never sees it, so the installer
+            // fell back to the interactive EULA prompt and failed with
+            // "/dev/tty: Device not configured" (ATO-… Poolside promo). Windows
+            // is unaffected because `$env:` sets the var for the whole session
+            // before `iex` runs, and PowerShell's installer defaults UpdatePath
+            // to true.
             let (program, args): (String, Vec<String>) = if cfg!(windows) {
                 (
                     "powershell".to_string(),
@@ -1713,7 +1726,7 @@ fn agent_install_spec(
                     "sh".to_string(),
                     vec![
                         "-c".to_string(),
-                        "POOL_INSTALL_ACCEPT_EULA=1 curl -fsSL https://downloads.poolside.ai/pool/install.sh | sh".to_string(),
+                        "curl -fsSL https://downloads.poolside.ai/pool/install.sh | POOL_INSTALL_ACCEPT_EULA=1 POOL_INSTALL_UPDATE_PATH=1 sh".to_string(),
                     ],
                 )
             };
