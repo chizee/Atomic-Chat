@@ -70,35 +70,31 @@ function extractModelIds(rawText: string, providerLabel: string): string[] {
       ? (data as Record<string, unknown>)
       : null
 
+  const idOf = (model: unknown): string =>
+    typeof model === 'string'
+      ? model
+      : model && typeof model === 'object' && 'id' in model
+        ? String((model as { id?: unknown }).id ?? '')
+        : ''
+
+  let ids: string[]
   if (obj && Array.isArray(obj.data)) {
-    return (obj.data as Array<{ id?: string }>)
-      .map((model) => model?.id ?? '')
-      .filter(Boolean)
+    // OpenAI shape: { data: [{ id }] }
+    ids = (obj.data as unknown[]).map(idOf).filter(Boolean)
+  } else if (Array.isArray(data)) {
+    // Bare array: ["id", …] or [{ id }, …]
+    ids = data.map(idOf).filter(Boolean)
+  } else if (obj && Array.isArray(obj.models)) {
+    // Alternative shape: { models: [...] }
+    ids = (obj.models as unknown[]).map(idOf).filter(Boolean)
+  } else {
+    console.warn('Unexpected response format from provider API:', data)
+    return []
   }
-  if (Array.isArray(data)) {
-    return (data as Array<unknown>)
-      .map((model) =>
-        typeof model === 'string'
-          ? model
-          : model && typeof model === 'object' && 'id' in model
-            ? String((model as { id?: unknown }).id ?? '')
-            : ''
-      )
-      .filter(Boolean)
-  }
-  if (obj && Array.isArray(obj.models)) {
-    return (obj.models as Array<unknown>)
-      .map((model) =>
-        typeof model === 'string'
-          ? model
-          : model && typeof model === 'object' && 'id' in model
-            ? String((model as { id?: unknown }).id ?? '')
-            : ''
-      )
-      .filter(Boolean)
-  }
-  console.warn('Unexpected response format from provider API:', data)
-  return []
+
+  // Some aggregators (e.g. AIML API) list the same model id more than once —
+  // dedupe so the UI doesn't show identical rows. Preserve first-seen order.
+  return Array.from(new Set(ids))
 }
 
 export class TauriProvidersService extends DefaultProvidersService {
