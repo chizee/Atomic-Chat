@@ -647,7 +647,7 @@ function ProviderDetail() {
       // expose hundreds of junk/internal IDs at /v1/models). When the flag is
       // explicitly false we show the curated registry list only and skip the
       // live probe. Missing/true keeps the hybrid behavior.
-      let finalProviders = fresh
+      let liveNewModels: Model[] = []
       let liveFetchError: Error | null = null
       const registrySupportsListing =
         registryProvider?.supports_model_listing !== false
@@ -667,7 +667,7 @@ function ProviderDetail() {
             ...existingIds,
             ...(registryProvider?.models ?? []).map((m) => m.id),
           ])
-          const liveNewModels = liveModelIds
+          liveNewModels = liveModelIds
             .filter((id) => !afterRegistryIds.has(id))
             .map((id) => ({
               id,
@@ -677,16 +677,7 @@ function ProviderDetail() {
               version: '1.0',
             }))
 
-          if (liveNewModels.length > 0) {
-            newCount += liveNewModels.length
-            // Inject the live-only models into the fresh providers snapshot
-            // so setProviders persists them together with the registry ones.
-            finalProviders = fresh.map((p) =>
-              p.provider === provider.provider
-                ? { ...p, models: [...(p.models ?? []), ...liveNewModels] }
-                : p
-            )
-          }
+          if (liveNewModels.length > 0) newCount += liveNewModels.length
 
           console.info(
             `[providers:${provider.provider}] live /models: ${liveModelIds.length} total, ${liveNewModels.length} new`
@@ -704,10 +695,31 @@ function ProviderDetail() {
         }
       }
 
-      // `setProviders` merges new models into useModelProvider while
-      // preserving API keys, base URLs, and user-tweaked settings on a
-      // per-provider basis. Existing models are NEVER removed.
-      setProviders(finalProviders)
+      // Apply the registry refresh. `setProviders` merges catalog updates while
+      // preserving API keys, base URLs, and user-tweaked settings per provider,
+      // and never removes existing models.
+      setProviders(fresh)
+
+      // Persist the live-discovered models onto THIS provider. We cannot inject
+      // into `fresh` because custom / self-hosted providers (AIML, Cerebras,
+      // LM Studio, vLLM, …) are NOT part of getProviders() output — they live
+      // only in useModelProvider state, so the old `fresh.map()` injection
+      // silently dropped them (toast said "Added N" but the list stayed empty).
+      // updateProvider operates on current state and works for both registry
+      // and custom providers.
+      if (liveNewModels.length > 0) {
+        const current =
+          useModelProvider.getState().getProviderByName(provider.provider) ??
+          provider
+        // Dedupe by id (first-seen wins) so both newly fetched duplicates and
+        // any duplicates already persisted from an earlier refresh collapse to
+        // a single row.
+        const byId = new Map<string, Model>()
+        for (const m of [...current.models, ...liveNewModels]) {
+          if (m.id && !byId.has(m.id)) byId.set(m.id, m)
+        }
+        updateProvider(provider.provider, { models: Array.from(byId.values()) })
+      }
 
       if (newCount > 0) {
         toast.success(t('providers:models'), {
