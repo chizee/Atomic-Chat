@@ -176,6 +176,20 @@ fn transform_anthropic_to_openai(body: &serde_json::Value) -> Option<serde_json:
 
     let openai_messages = convert_messages(messages, body.get("system"))?;
 
+    // Strict chat templates (e.g. AtomicChat/ornith-9b, Qwen3-family GGUFs)
+    // `raise` "System message must be at the beginning" whenever a request
+    // carries more than one system message or a non-leading one. Claude Code
+    // triggers this by combining its system prompt with developer/system items,
+    // and the failure surfaces during llama.cpp's tool-call parser generation.
+    // Collapse them into a single leading system message — the same fix already
+    // applied on the Codex `/responses` path (see responses_shim).
+    let openai_messages = match openai_messages.as_array() {
+        Some(arr) => serde_json::Value::Array(super::responses_shim::merge_system_messages(
+            arr.clone(),
+        )),
+        None => openai_messages,
+    };
+
     let stream = body
         .get("stream")
         .and_then(|v| v.as_bool())
