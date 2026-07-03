@@ -163,7 +163,20 @@ function setLastUsedModel(provider: string, model: string) {
   }
 }
 
+// Tail of the switch queue. Every `switchToModel` chains onto this so switches
+// run strictly one-at-a-time. Crucially this is a real queue, NOT a
+// `while (activeSwitchPromise) await` spin: the spin let *every* waiter wake and
+// fall through the moment the in-flight promise resolved, so two switches could
+// then run `doSwitchToModel` concurrently — one engine spins up while the other
+// `stopAllModels()`-es it away, producing the "turboquant switch briefly
+// launched an MLX server, dropped it, failed, then worked on retry" race.
 let activeSwitchPromise: Promise<void> | null = null
+// Monotonic id of the most recently *enqueued* switch. A queued switch compares
+// its own id against this right before doing work; if a newer switch has since
+// been enqueued it supersedes this one, so we skip the stale load entirely
+// (e.g. an auto-start of the previous model that the user's manual pick already
+// replaced — no more wasted engine spawn + teardown).
+let switchSeq = 0
 
 // WS2 (Sentry desktop top-10): the ChatInput auto-start effect re-fires whenever
 // `serverStatus` / `loadingModel` change, and a failed load flips both — so a
@@ -349,47 +362,65 @@ export async function switchToModel(params: {
   serviceHub: ServiceHub
   isAutoStart?: boolean
 }): Promise<void> {
-  // Wait for any in-flight switch to complete before starting a new one.
-  while (activeSwitchPromise) {
-    try {
-      await activeSwitchPromise
-    } catch {
-      // Previous switch failed — proceed with the new one.
+  // Claim a slot in the queue. `mySeq` lets us detect if a newer switch was
+  // enqueued behind us while we waited for earlier ones to finish.
+  const mySeq = ++switchSeq
+  const prior = activeSwitchPromise
+
+  const run = async (): Promise<void> => {
+    // Supersession: another switch was requested after this one while we were
+    // waiting our turn. That later request is the user's real intent, so drop
+    // this stale load instead of spinning up an engine the next switch would
+    // immediately tear down (root of the MLX-then-drop race on manual picks).
+    if (mySeq !== switchSeq) {
+      console.log(
+        '[switchToModel] Superseded by a newer switch, skipping:',
+        params.modelId,
+        'provider:',
+        params.providerName
+      )
+      return
     }
+
+    if (await isTargetModelAlreadyServing(params)) {
+      const activeModels = await params.serviceHub
+        .models()
+        .getActiveModels()
+        .catch(() => [] as string[])
+
+      useAppState.getState().setServerStatus('running')
+      // getActiveModels() is local-engine only; preserve any cloud model that
+      // is already "active" in the UI so re-selecting the same cloud target
+      // does not wipe out the global active-model state.
+      syncActiveModelsFromEngines(activeModels || [])
+      syncModelSelection(params.providerName, params.modelId)
+      // WS2: the target is healthy — clear any prior auto-start failure record.
+      clearAutoStartFailure(params.providerName, params.modelId)
+      // ATO-63: the model is up — drop any stale "Failed to load" toast.
+      clearModelLoadError()
+      maybePromptTurboquantOptimal(params.providerName)
+      console.log(
+        '[switchToModel] Target already active, skipping restart:',
+        params.modelId,
+        'provider:',
+        params.providerName
+      )
+      return
+    }
+
+    await doSwitchToModel(params)
   }
 
-  if (await isTargetModelAlreadyServing(params)) {
-    const activeModels = await params.serviceHub
-      .models()
-      .getActiveModels()
-      .catch(() => [] as string[])
-
-    useAppState.getState().setServerStatus('running')
-    // getActiveModels() is local-engine only; preserve any cloud model that
-    // is already "active" in the UI so re-selecting the same cloud target
-    // does not wipe out the global active-model state.
-    syncActiveModelsFromEngines(activeModels || [])
-    syncModelSelection(params.providerName, params.modelId)
-    // WS2: the target is healthy — clear any prior auto-start failure record.
-    clearAutoStartFailure(params.providerName, params.modelId)
-    // ATO-63: the model is up — drop any stale "Failed to load" toast.
-    clearModelLoadError()
-    maybePromptTurboquantOptimal(params.providerName)
-    console.log(
-      '[switchToModel] Target already active, skipping restart:',
-      params.modelId,
-      'provider:',
-      params.providerName
-    )
-    return
-  }
-
-  const promise = doSwitchToModel(params)
-  activeSwitchPromise = promise
+  // Chain strictly after any in-flight/queued switch. A prior failure must not
+  // break the chain, so swallow it and still run ours.
+  const chained = (prior ?? Promise.resolve()).then(run, run)
+  activeSwitchPromise = chained
   try {
-    await promise
+    await chained
   } finally {
-    if (activeSwitchPromise === promise) {
+    // Only clear the tail if nobody chained after us; otherwise the later
+    // switch owns the tail and must keep the queue intact.
+    if (activeSwitchPromise === chained) {
       activeSwitchPromise = null
     }
   }

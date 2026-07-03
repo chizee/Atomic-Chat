@@ -368,6 +368,14 @@ pub fn run() {
             #[cfg(any(target_os = "ios", target_os = "android"))]
             app.handle().plugin(log_builder.build())?;
 
+            // Reap backend processes orphaned by a previous *abnormal* exit
+            // (crash / OOM / Force Quit / SIGKILL — none of which run our
+            // RunEvent::Exit cleanup) before any engine spawns. Single-instance
+            // guarantees these can only be our own leftovers. Kept after logger
+            // init so its actions are recorded in app.log.
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            crate::core::process_reaper::reap_orphan_backends(app.handle());
+
             #[cfg(target_os = "windows")]
             {
                 if let Err(e) = crate::core::notifications::ensure_aumid_registered(
