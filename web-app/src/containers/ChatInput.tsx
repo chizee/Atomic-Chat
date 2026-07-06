@@ -267,6 +267,15 @@ const ChatInput = memo(function ChatInput({
     selectedModel?.id,
     serverStatus,
     serviceHub,
+    // ATO-244: re-run when the model flips from active to inactive without
+    // selectedModel/selectedProvider changing — e.g. when the backend crashes
+    // mid-generation and DataProvider.tsx's session-died handler drops it
+    // from `activeModels`. Without this, staying on the same model/provider
+    // (the common "New chat" case) never re-checks and just keeps sending
+    // into the dead backend. The one extra re-run once `switchToModel`
+    // finishes and marks the model active again is a harmless no-op (the
+    // active-model check above short-circuits immediately).
+    isModelActive,
   ])
 
   const isLocalModelNotReady =

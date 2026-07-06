@@ -381,6 +381,16 @@ export function getBackendDownloadUrl(
   return `${LLAMACPP_DOWNLOAD_BASE}/${version}/llama-${version}-bin-${backend}.zip`
 }
 
+export function getBackendArchiveName(version: string, backend: string): string {
+  version = version.replace(/\uFEFF/g, '').trim()
+  backend = backend.replace(/\uFEFF/g, '').trim()
+  const linuxInfix = LINUX_UPSTREAM_ASSET_BY_BACKEND[backend]
+  if (linuxInfix) {
+    return `llama-${version}-bin-${linuxInfix}.tar.gz`
+  }
+  return `llama-${version}-bin-${backend}.zip`
+}
+
 /**
  * Maps an internal backend id (e.g. `win-cuda-13.4-x64`, `linux-vulkan-x64`)
  * to a short human-friendly variant label used by the "Latest <variant>"

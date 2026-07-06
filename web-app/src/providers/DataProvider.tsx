@@ -566,6 +566,22 @@ export function DataProvider() {
             '[LocalAPI] llamacpp_upstream_session_died:',
             event.payload
           )
+          // ATO-244: the backend process is gone, but `useAppState.activeModels`
+          // (the store every "is this model running?" check in the UI reads
+          // from — ChatInput's auto-start effect, the status dot, etc.) still
+          // lists it as active until something re-queries the engine. Without
+          // this, a "New chat" on the same model/provider never re-checks
+          // (its auto-start effect only reruns on model/provider change) and
+          // just sends straight into the dead backend, surfacing a raw
+          // "Connection refused" instead of silently reloading. Dropping the
+          // model here flips `isModelActive` to false, which re-triggers that
+          // effect and lets it restart the model on its own.
+          if (model_id) {
+            const { activeModels, setActiveModels } = useAppState.getState()
+            if (activeModels.includes(model_id)) {
+              setActiveModels(activeModels.filter((id) => id !== model_id))
+            }
+          }
           toast.error('Model crashed during generation', {
             id: `session-died-${model_id ?? 'unknown'}`,
             description:

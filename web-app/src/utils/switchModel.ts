@@ -425,17 +425,33 @@ async function doSwitchToModel(params: {
       console.log('[switchToModel] Cloud provider registered:', providerName)
     }
 
-    // 5. Start the Local API Server.
-    const actualPort = await window.core?.api?.startServer({
-      host: serverState.serverHost,
-      port: serverState.serverPort,
-      prefix: serverState.apiPrefix,
-      apiKey: serverState.apiKey,
-      trustedHosts: serverState.trustedHosts,
-      isCorsEnabled: serverState.corsEnabled,
-      isVerboseEnabled: serverState.verboseLogs,
-      proxyTimeout: serverState.proxyTimeout,
-    })
+    // 5. Start the Local API Server. It's a process-wide singleton (one
+    //    proxy on serverState.serverPort shared by every provider), so a
+    //    "Server is already running" rejection here just means some other
+    //    switch/startup path already stood it up — not a load failure. This
+    //    matters most on crash recovery (ATO-244): the model above may have
+    //    just loaded successfully while a concurrent start-server call (e.g.
+    //    from another in-flight switch) wins the race, and without this
+    //    guard that benign race would surface as a spurious "Failed to load
+    //    the model" toast on top of a model that is, in fact, running fine.
+    //    Mirrors the same handling in hermes-agent.tsx / claude-code.tsx.
+    let actualPort: number | undefined
+    try {
+      actualPort = await window.core?.api?.startServer({
+        host: serverState.serverHost,
+        port: serverState.serverPort,
+        prefix: serverState.apiPrefix,
+        apiKey: serverState.apiKey,
+        trustedHosts: serverState.trustedHosts,
+        isCorsEnabled: serverState.corsEnabled,
+        isVerboseEnabled: serverState.verboseLogs,
+        proxyTimeout: serverState.proxyTimeout,
+      })
+    } catch (startErr) {
+      const msg =
+        startErr instanceof Error ? startErr.message : String(startErr)
+      if (!msg.includes('already running')) throw startErr
+    }
     console.log('[switchToModel] Server started on port:', actualPort)
 
     if (actualPort && actualPort !== serverState.serverPort) {

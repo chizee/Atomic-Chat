@@ -108,6 +108,7 @@ pub fn run() {
         core::filesystem::commands::write_yaml,
         core::filesystem::commands::read_yaml,
         core::filesystem::commands::decompress,
+        core::filesystem::commands::normalize_backend_layout,
         core::filesystem::commands::open_dialog,
         core::filesystem::commands::save_dialog,
         // App configuration commands
@@ -226,6 +227,7 @@ pub fn run() {
         core::filesystem::commands::write_yaml,
         core::filesystem::commands::read_yaml,
         core::filesystem::commands::decompress,
+        core::filesystem::commands::normalize_backend_layout,
         core::filesystem::commands::open_dialog,
         core::filesystem::commands::save_dialog,
         // App configuration commands

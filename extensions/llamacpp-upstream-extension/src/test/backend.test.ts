@@ -4,6 +4,7 @@ import {
   getBackendExePath,
   isBackendInstalled,
   fetchRemoteBackends,
+  getBackendArchiveName,
 } from '../backend'
 import { getSystemInfo } from '../hardware'
 import { fetch as tauriFetch } from '@tauri-apps/plugin-http'
@@ -61,6 +62,23 @@ describe('Backend functions', () => {
 
   afterEach(() => {
     vi.restoreAllMocks()
+  })
+
+  describe('getBackendArchiveName', () => {
+    it('uses upstream ubuntu tarball names for Linux backend archives', () => {
+      expect(getBackendArchiveName('b9691', 'linux-vulkan-x64')).toBe(
+        'llama-b9691-bin-ubuntu-vulkan-x64.tar.gz'
+      )
+      expect(getBackendArchiveName('b9691', 'linux-cpu-x64')).toBe(
+        'llama-b9691-bin-ubuntu-x64.tar.gz'
+      )
+    })
+
+    it('keeps zip archive names for non-Linux backend archives', () => {
+      expect(getBackendArchiveName('b9691', 'win-cpu-x64')).toBe(
+        'llama-b9691-bin-win-cpu-x64.zip'
+      )
+    })
   })
 
   describe('getBackendDir and getBackendExePath', () => {

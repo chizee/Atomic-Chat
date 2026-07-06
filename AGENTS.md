@@ -309,6 +309,145 @@ Append-only. Newest at top. Each entry follows this shape:
 
 ---
 
+### 2026-07-06 — Fix an app-freezing event-listener storm and make the UI reactively recover from a crashed `llamacpp-upstream` session (ATO-244, Linux Vulkan verification)
+- **Context:** Verifying ATO-244's crash-recovery behavior on Linux/Vulkan
+ (`kill -SEGV` on `llama-server`) surfaced two bugs that blocked the
+ verification entirely and one UX gap the ticket actually cares about.
+ 1. **App-freezing bug.** `handleSessionDied()` in
+ [`extensions/llamacpp-upstream-extension/src/index.ts`](extensions/llamacpp-upstream-extension/src/index.ts)
+ both *listened to* and *re-emitted* the same
+ `local_backend://llamacpp_upstream_session_died` Tauri event, so every
+ dispatch re-triggered itself — a self-sustaining loop that saturated the
+ event queue and froze the whole app on the very first simulated crash.
+ Compounding it,
+ [`ExtensionProvider.tsx`](web-app/src/providers/ExtensionProvider.tsx)
+ re-ran its full extension bootstrap (`registerActive()` + `load()`,
+ wiring a fresh `SESSION_DIED_EVENT` listener) on every effect
+ invocation with no de-dup guard; React 18 StrictMode's dev-mode
+ double-invoke (and any other remount) orphaned the previous
+ `ExtensionManager` instance — and its listeners — with nothing left
+ to unlisten them, so duplicate handlers accumulated across reloads and
+ made the freeze worse the longer a dev session ran.
+ 2. **UX gap (the actual ATO-244 ask).** Once the freeze was fixed, a
+ crash still left the model stuck: `useAppState.activeModels` was never
+ updated when the backend died, so `ChatInput`'s auto-start effect
+ (gated on `selectedModel`/`selectedProvider` changing, not on
+ liveness) never re-ran and kept sending into the dead process —
+ "New chat" on the same model did nothing, and the only workaround was
+ switching to a different model and back. That workaround itself then
+ hit a **second**, spurious failure: `doSwitchToModel`
+ ([`switchModel.ts`](web-app/src/utils/switchModel.ts)) treated the
+ Local API Server's "Server is already running" rejection (a benign
+ outcome — the proxy is a process-wide singleton on `serverState.serverPort`
+ shared by every provider) as a fatal load error, so a model that had
+ in fact just reloaded successfully still surfaced a
+ "Failed to load the model" toast on top.
+- **Decision:**
+ 1. **Kill the self-emit.** Removed the redundant `tauriEmit(SESSION_DIED_EVENT, …)`
+ call from `handleSessionDied()` — the extension only needs to *react*
+ to the Rust-emitted event (mark the session dead, let the reload path
+ pick it back up), never re-broadcast it.
+ 2. **Module-level singleton guard for extension setup.** `ExtensionProvider.tsx`
+ now caches the bootstrap promise in a module-level
+ `extensionsSetupPromise` so `registerActive()`/`load()` (and every
+ listener an extension's `onLoad()` wires) run exactly once for the
+ module's lifetime; the effect cleanup no longer calls
+ `ExtensionManager.getInstance().unload()` (this provider is an
+ app-root singleton, not a per-mount resource — unloading on
+ StrictMode's synthetic dev cleanup would tear down extensions the
+ guard above just decided not to reinitialize).
+ 3. **Reactive recovery wiring.** The `SESSION_DIED_EVENT` handler in
+ [`DataProvider.tsx`](web-app/src/providers/DataProvider.tsx) now drops
+ the crashed `model_id` from `useAppState.activeModels` before showing
+ the crash toast, so the UI's notion of "is this model running" matches
+ reality; [`ChatInput.tsx`](web-app/src/containers/ChatInput.tsx)'s
+ auto-start effect gained the derived `isModelActive` flag as a
+ dependency, so flipping active→inactive on the *same* model/provider
+ (the crash case) now re-triggers the same auto-start path a fresh
+ model selection would. `doSwitchToModel` wraps the `startServer` call
+ so an "already running" rejection is swallowed instead of thrown,
+ mirroring the equivalent handling already present in the
+ Hermes/Claude-Code launch flows.
+- **Consequences:** A killed `llama-server` process now self-heals with a
+ single crash toast and no further user action — "New chat" (or even just
+ clicking Retry) reloads the model in place instead of requiring a
+ model-switch workaround, and the workaround path no longer throws a
+ second, misleading toast on top. The freeze fix is a strict prerequisite
+ for any of this being observable at all — without it, the app locks up
+ before the recovery path ever gets a chance to run. **Verified interactively**
+ on Linux/Vulkan (`turboquant-linux-x64-vulkan` backend, `kill -SEGV` on the
+ live `llama-server` PID): single crash toast, model auto-reloads in the
+ background, and a subsequent Retry/New chat gets a working response with
+ no extra toasts. **Not done:** the crash-toast copy in `DataProvider.tsx`
+ is still hardcoded English (not run through i18n) — flagged as a
+ follow-up, not blocking for this fix. No unit/integration test was added
+ for the event self-emit loop or the StrictMode double-init guard (both are
+ timing/lifecycle bugs that are awkward to assert deterministically); the
+ fix was validated via manual reproduction (freeze on crash → no freeze)
+ before and after.
+- **Owner:** team.
+- **Links:** the same-day ADR *Normalize runtime-downloaded upstream
+ llama.cpp backend layouts …* (this session's prerequisite Linux Vulkan
+ backend-install fix), the 2026-06-17 ADR *Recover the poisoned Metal
+ backend + surface a clear OOM message …* (the macOS/Metal analog of
+ reactive backend-crash recovery), files:
+ [`extensions/llamacpp-upstream-extension/src/index.ts`](extensions/llamacpp-upstream-extension/src/index.ts)
+ (`handleSessionDied`),
+ [`web-app/src/providers/ExtensionProvider.tsx`](web-app/src/providers/ExtensionProvider.tsx)
+ (`extensionsSetupPromise`),
+ [`web-app/src/providers/DataProvider.tsx`](web-app/src/providers/DataProvider.tsx)
+ (`local_backend://llamacpp_upstream_session_died` listener),
+ [`web-app/src/containers/ChatInput.tsx`](web-app/src/containers/ChatInput.tsx)
+ (auto-start effect `isModelActive` dependency),
+ [`web-app/src/utils/switchModel.ts`](web-app/src/utils/switchModel.ts)
+ (`doSwitchToModel` `startServer` idempotent handling).
+
+---
+
+### 2026-07-06 — Normalize runtime-downloaded upstream llama.cpp backend layouts in Rust after extraction
+- **Context:** On Linux dev builds, the `llamacpp-upstream` "Better
+ Configuration Available" flow downloaded `b9691/linux-vulkan-x64` from the
+ correct ggml-org `.tar.gz` URL, but installation retried forever after
+ `Download complete, extracting...`. Two installer gaps were found: the
+ temporary archive name was still hardcoded as `.zip` before the first fix, and
+ the post-extract relocation was implemented in the extension via legacy
+ webview filesystem calls (`readdirSync` + `mv` + `rm`). The latter proved
+ brittle on ggml-org Linux tarballs that unpack under a nested `llama-b9691/`
+ directory: the app logged `Relocating nested backend layout llama-b9691/ into
+ build/bin/`, but the expected `<backend>/build/bin/llama-server` never
+ appeared, so `isBackendInstalled` failed and the app re-downloaded.
+- **Decision:** Keep the URL/filename mapping in the extension via
+ `getBackendArchiveName(version, backend)` (`linux-*` → upstream `ubuntu*.tar.gz`,
+ non-Linux → `.zip`), but move post-extract backend-layout normalization into a
+ Rust Tauri command `normalize_backend_layout(output_dir, exe_name)` beside
+ `decompress`. The command is scoped under the Atomic Chat data folder, accepts
+ already-normalized layouts as a no-op, moves either flat extracted binaries or
+ a nested `llama-*` directory into `<backend>/build/bin/`, removes the nested
+ directory, and returns an actionable error if the expected executable is still
+ missing. `downloadAndInstallBackend` now calls it immediately after
+ `decompress` and before the final `isBackendInstalled` check.
+- **Consequences:** Runtime backend downloads now use the same trusted layer as
+ extraction for filesystem reshaping, avoiding partial installs caused by
+ frontend FS API rename/remove edge cases. Linux Vulkan/CPU upstream tarballs
+ should install to `build/bin/llama-server` after one download. Existing broken
+ partial backend directories should be deleted before retrying in dev. **Verified:**
+ `git diff --check` clean; `cargo check -p Atomic-Chat` reached Tauri
+ `generate_context!` and failed only because `web-app/dist` was absent in the
+ dev checkout (no Rust type errors before that point). Full runtime smoke is
+ still required through `make dev-fast` + downloading `b9691/linux-vulkan-x64`.
+- **Owner:** team.
+- **Links:** files:
+ [`extensions/llamacpp-upstream-extension/src/backend.ts`](extensions/llamacpp-upstream-extension/src/backend.ts)
+ (`getBackendArchiveName`),
+ [`extensions/llamacpp-upstream-extension/src/index.ts`](extensions/llamacpp-upstream-extension/src/index.ts)
+ (`downloadAndInstallBackend`),
+ [`extensions/llamacpp-upstream-extension/src/test/backend.test.ts`](extensions/llamacpp-upstream-extension/src/test/backend.test.ts),
+ [`src-tauri/src/core/filesystem/commands.rs`](src-tauri/src/core/filesystem/commands.rs)
+ (`normalize_backend_layout`),
+ [`src-tauri/src/lib.rs`](src-tauri/src/lib.rs) (command registration).
+
+---
+
 ### 2026-06-25 — Propagate the app proxy into Launch-page agent installers, refresh the Windows PATH at install/detect time, and stop "Find optimal backend" picking Vulkan on integrated-only iGPUs
 - **Context:** Three Windows-confirmed defects from a user log + screenshots.
  (Class I) External coding-agent install on the Launch page failed with
