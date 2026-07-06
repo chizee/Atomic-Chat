@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use crate::core::{downloads::models::DownloadManagerState, mcp::models::McpSettings};
 use rmcp::{
     model::{CallToolRequestParam, CallToolResult, InitializeRequestParam, Tool},
-    service::RunningService,
+    service::{Peer, RunningService},
     RoleClient, ServiceError,
 };
 use tokio::sync::{oneshot, Mutex, Notify};
@@ -88,6 +88,18 @@ impl RunningServiceEnum {
         match self {
             Self::NoInit(s) => s.list_all_tools().await,
             Self::WithInit(s) => s.list_all_tools().await,
+        }
+    }
+
+    /// Cloneable client handle for this server. `Peer` is a cheap `Clone`
+    /// (Arc-backed) and exposes the same request methods (`list_all_tools`,
+    /// `call_tool`, …) as the owning `RunningService`. Cloning it lets callers
+    /// release the `mcp_servers` map lock *before* doing slow network round
+    /// trips, so one unresponsive server can't block the whole map (ATO-271).
+    pub fn peer(&self) -> Peer<RoleClient> {
+        match self {
+            Self::NoInit(s) => s.peer().clone(),
+            Self::WithInit(s) => s.peer().clone(),
         }
     }
     pub async fn call_tool(

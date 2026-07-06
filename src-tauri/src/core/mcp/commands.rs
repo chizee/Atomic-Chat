@@ -1,4 +1,5 @@
 use rmcp::model::{CallToolRequestParam, CallToolResult};
+use rmcp::{service::Peer, RoleClient};
 use serde_json::{json, Map, Value};
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 use tokio::sync::oneshot;
@@ -7,7 +8,7 @@ use tokio::time::timeout;
 use super::{
     constants::{
         default_filesystem_root, default_mcp_config, filesystem_mcp_pinned_spec,
-        FILESYSTEM_MCP_PACKAGE, LEGACY_FILESYSTEM_PLACEHOLDER,
+        DEFAULT_MCP_TOOL_LIST_TIMEOUT_SECS, FILESYSTEM_MCP_PACKAGE, LEGACY_FILESYSTEM_PLACEHOLDER,
     },
     helpers::{restart_active_mcp_servers, start_mcp_server},
 };
@@ -166,28 +167,52 @@ pub async fn get_connected_servers(
 /// 6. Returns the combined list of all available tools with server information
 #[tauri::command]
 pub async fn get_tools(state: State<'_, AppState>) -> Result<Vec<ToolWithServer>, String> {
-    let timeout_duration = tool_call_timeout(&state).await;
-    let servers = state.mcp_servers.lock().await;
+    // Short, dedicated listing timeout — NOT the 30s tool-call timeout. Listing
+    // is a metadata round-trip; a healthy server answers in ms.
+    let list_timeout = Duration::from_secs(DEFAULT_MCP_TOOL_LIST_TIMEOUT_SECS);
+
+    // Snapshot cloneable client handles under the lock, then release it. Holding
+    // `mcp_servers` across the (potentially slow / hanging) network listing was
+    // the root of the freeze: a single unresponsive server (e.g. a dead remote
+    // MCP) blocked the lock for its full timeout, stalling every other consumer
+    // that needs the map — chat send, model-switch re-init, the tools UI. With
+    // the lock dropped here, listing runs entirely outside the critical section
+    // (ATO-271).
+    let handles: Vec<(String, Peer<RoleClient>)> = {
+        let servers = state.mcp_servers.lock().await;
+        servers
+            .iter()
+            .map(|(name, service)| (name.clone(), service.peer()))
+            .collect()
+    };
+
+    // List every server concurrently, each capped by its own short timeout, so
+    // one slow/dead server delays only itself — total latency is bounded by
+    // `list_timeout`, not the sum across servers.
+    let per_server = handles.into_iter().map(|(server_name, peer)| {
+        let list_timeout = list_timeout;
+        async move {
+            match timeout(list_timeout, peer.list_all_tools()).await {
+                Ok(Ok(tools)) => (server_name, tools),
+                Ok(Err(e)) => {
+                    log::warn!("MCP server {server_name} failed to list tools: {e}");
+                    (server_name, Vec::new())
+                }
+                Err(_) => {
+                    log::warn!(
+                        "MCP server {server_name}: listing tools timed out after {}s",
+                        list_timeout.as_secs()
+                    );
+                    (server_name, Vec::new())
+                }
+            }
+        }
+    });
+
+    let results = futures_util::future::join_all(per_server).await;
+
     let mut all_tools: Vec<ToolWithServer> = Vec::new();
-
-    for (server_name, service) in servers.iter() {
-        // List tools with timeout
-        let tools_future = service.list_all_tools();
-        let tools = match timeout(timeout_duration, tools_future).await {
-            Ok(Ok(tools)) => tools,
-            Ok(Err(e)) => {
-                log::warn!("MCP server {} failed to list tools: {}", server_name, e);
-                continue;
-            }
-            Err(_) => {
-                log::warn!(
-                    "Listing tools timed out after {} seconds",
-                    timeout_duration.as_secs()
-                );
-                continue; // Skip this server and continue with others
-            }
-        };
-
+    for (server_name, tools) in results {
         for tool in tools {
             all_tools.push(ToolWithServer {
                 name: tool.name.to_string(),

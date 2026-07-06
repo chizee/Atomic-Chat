@@ -9,7 +9,7 @@ import { cn } from '@/lib/utils'
 import { useModelProvider } from '@/hooks/useModelProvider'
 import SetupScreen from '@/containers/SetupScreen'
 import { route } from '@/constants/routes'
-import { isKnownProvider } from '@/stores/provider-registry-store'
+import { hasValidProviders } from '@/lib/onboarding'
 import { localStorageKey } from '@/constants/localStorage'
 
 type ThreadModel = {
@@ -51,32 +51,17 @@ function Index() {
     (typeof window !== 'undefined' &&
       localStorage.getItem(localStorageKey.setupCompleted) === 'true')
 
-  // Conditional to check if there are any valid providers
-  // required min 1 api_key or 1 model in llama.cpp or jan provider
-  // Custom providers (not registered in the system catalog) don't require
-  // api_key but must have models.
-  const hasValidProviders = providers.some((provider) => {
-    const isPredefinedProvider = isKnownProvider(provider.provider)
-
-    // Custom providers don't need API key validation but must have models
-    if (!isPredefinedProvider) {
-      return provider.models.length > 0
-    }
-
-    // Predefined providers need either API key or models (for llamacpp/jan)
-    return (
-      provider.api_key?.length ||
-      (provider.provider === 'llamacpp' && provider.models.length) ||
-      (provider.provider === 'jan' && provider.models.length)
-    )
-  })
+  // Conditional to check if there are any valid providers: min 1 api_key or 1
+  // model in llama.cpp / jan, or a custom provider with models. Shared with the
+  // startup auto-start gate so the two can never disagree about onboarding.
+  const validProviders = hasValidProviders(providers)
 
   useEffect(() => {
     setCurrentThreadId(undefined)
   }, [setCurrentThreadId])
 
   //* Dev-флаг FORCE_ONBOARDING — принудительный показ SetupScreen без удаления моделей
-  if (FORCE_ONBOARDING || (!hasValidProviders && !setupCompletedOrSkipped)) {
+  if (FORCE_ONBOARDING || (!validProviders && !setupCompletedOrSkipped)) {
     return (
       <SetupScreen
         onSkipped={() => setSetupSkippedThisSession(true)}

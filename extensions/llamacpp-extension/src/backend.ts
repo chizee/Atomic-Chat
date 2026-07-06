@@ -373,13 +373,54 @@ export async function getBackendExePath(
   return exePath
 }
 
+/**
+ * Windows-only defense-in-depth: a correctly packaged TurboQuant Windows
+ * backend ships `llama-server.exe` alongside its dependency DLLs
+ * (`llama-server-impl.dll`, `ggml*.dll`, cudart/cublas, ...) extracted from
+ * the same archive into the same `build/bin` directory. A CI packaging
+ * regression could relocate the exe without its DLLs, leaving a directory
+ * that looks "installed" (the exe exists) but crashes on load with a
+ * missing-DLL error ([LLAMA_CPP_PROCESS_ERROR]). Detect that shape
+ * generically - without hardcoding DLL names, which vary per backend
+ * variant (CPU/CUDA/Vulkan) - by requiring at least one `.dll` sibling
+ * next to the exe.
+ */
+async function windowsBackendHasDlls(exePath: string): Promise<boolean> {
+  const lastSlash = Math.max(
+    exePath.lastIndexOf('/'),
+    exePath.lastIndexOf('\\')
+  )
+  if (lastSlash === -1) return false
+  const exeDir = exePath.slice(0, lastSlash)
+  try {
+    const entries = (await fs.readdirSync(exeDir)) as string[]
+    return entries.some((name) => name.toLowerCase().endsWith('.dll'))
+  } catch (err) {
+    // Unable to enumerate the directory - don't block installation
+    // detection on an unrelated filesystem quirk we can't diagnose here;
+    // the exe-existence check above remains authoritative in that case.
+    console.warn(
+      `[isBackendInstalled] Failed to check for DLLs in ${exeDir}:`,
+      err
+    )
+    return true
+  }
+}
+
 export async function isBackendInstalled(
   backend: string,
   version: string
 ): Promise<boolean> {
   const exePath = await getBackendExePath(backend, version)
   const result = await fs.existsSync(exePath)
-  return result
+  if (!result) return false
+  if (IS_WINDOWS && !(await windowsBackendHasDlls(exePath))) {
+    console.warn(
+      `[isBackendInstalled] ${backend}/${version}: exe found but no DLLs alongside it - treating as not installed`
+    )
+    return false
+  }
+  return true
 }
 
 async function _getSupportedFeatures() {

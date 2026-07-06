@@ -7,7 +7,10 @@ import { useThreads } from '@/hooks/useThreads'
 import { localStorageKey } from '@/constants/localStorage'
 import i18n from '@/i18n/setup'
 import type { ServiceHub } from '@/services'
-import { registerRemoteProvider } from '@/utils/registerRemoteProvider'
+import {
+  isKeylessRemoteProvider,
+  registerRemoteProvider,
+} from '@/utils/registerRemoteProvider'
 import { syncActiveModelsFromEngines } from '@/utils/activeModelsSync'
 import posthog from 'posthog-js'
 import {
@@ -22,7 +25,13 @@ import {
   shouldEmitModelLoadFailure,
 } from '@/lib/telemetry'
 import { captureHandledError } from '@/lib/sentry'
-import { getProviderTitle } from '@/lib/utils'
+import {
+  getProviderTitle,
+  MODEL_LOAD_WATCHDOG_MS,
+  OPERATION_TIMED_OUT_CODE,
+  SERVER_START_WATCHDOG_MS,
+  withTimeout,
+} from '@/lib/utils'
 
 type ModelSettingEntry = { controller_props?: { value?: unknown } }
 type LoadableModel = {
@@ -112,6 +121,37 @@ function isLocalEngineProvider(providerName: string): boolean {
   return (LOCAL_PROVIDERS as readonly string[]).includes(providerName)
 }
 
+// ATO-270: `doSwitchToModel` has no ceiling on how long it waits for the
+// model to load or the proxy server to start — if either step gets stuck on
+// an un-timeboxed network call somewhere in backend preparation, the promise
+// never settles and the "Starting Server" UI (`serverStatus === 'pending'`)
+// hangs forever, with no error and no way to retry. `MODEL_LOAD_WATCHDOG_MS`
+// / `SERVER_START_WATCHDOG_MS` (see `@/lib/utils`) are a last-resort safety
+// net, not a replacement for fixing the underlying stall: on expiry the
+// `catch` block below runs exactly as it would for any other failure
+// (status reset, toast, telemetry) instead of leaving the app stuck.
+const LOCAL_API_SERVER_START_TIMEOUT_CODE = 'LOCAL_API_SERVER_START_TIMEOUT'
+
+/** Re-tags a `withTimeout` expiry with the ATO-270-specific error code used
+ * to force a toast even on auto-start (see `reportModelLoadError`), while
+ * leaving every other rejection (a genuine failure, not a timeout) untouched. */
+function taggedWithTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  message: string
+): Promise<T> {
+  return withTimeout(promise, ms, message).catch((error: unknown) => {
+    if (
+      error &&
+      typeof error === 'object' &&
+      (error as { code?: string }).code === OPERATION_TIMED_OUT_CODE
+    ) {
+      (error as { code?: string }).code = LOCAL_API_SERVER_START_TIMEOUT_CODE
+    }
+    throw error
+  })
+}
+
 function setLastUsedModel(provider: string, model: string) {
   try {
     localStorage.setItem(
@@ -123,7 +163,20 @@ function setLastUsedModel(provider: string, model: string) {
   }
 }
 
+// Tail of the switch queue. Every `switchToModel` chains onto this so switches
+// run strictly one-at-a-time. Crucially this is a real queue, NOT a
+// `while (activeSwitchPromise) await` spin: the spin let *every* waiter wake and
+// fall through the moment the in-flight promise resolved, so two switches could
+// then run `doSwitchToModel` concurrently — one engine spins up while the other
+// `stopAllModels()`-es it away, producing the "turboquant switch briefly
+// launched an MLX server, dropped it, failed, then worked on retry" race.
 let activeSwitchPromise: Promise<void> | null = null
+// Monotonic id of the most recently *enqueued* switch. A queued switch compares
+// its own id against this right before doing work; if a newer switch has since
+// been enqueued it supersedes this one, so we skip the stale load entirely
+// (e.g. an auto-start of the previous model that the user's manual pick already
+// replaced — no more wasted engine spawn + teardown).
+let switchSeq = 0
 
 // WS2 (Sentry desktop top-10): the ChatInput auto-start effect re-fires whenever
 // `serverStatus` / `loadingModel` change, and a failed load flips both — so a
@@ -141,6 +194,9 @@ const TERMINAL_LOAD_CODES = new Set([
   // only a manual re-download resolves it, so don't loop the auto-start.
   'MODEL_FILE_CORRUPT',
   'BINARY_NOT_FOUND',
+  // The engine build can't parse this model's architecture/format (e.g. a
+  // newer qwen3vl GGUF). Retrying loads the same unsupported file — never auto-retry.
+  'MODEL_ARCH_NOT_SUPPORTED',
   // ATO-190: the bundled macOS engine requires a newer macOS than the host
   // (missing Metal symbol). This never resolves on retry, so never auto-retry.
   'OS_VERSION_UNSUPPORTED',
@@ -304,48 +360,67 @@ export async function switchToModel(params: {
   modelId: string
   providerName: string
   serviceHub: ServiceHub
+  isAutoStart?: boolean
 }): Promise<void> {
-  // Wait for any in-flight switch to complete before starting a new one.
-  while (activeSwitchPromise) {
-    try {
-      await activeSwitchPromise
-    } catch {
-      // Previous switch failed — proceed with the new one.
+  // Claim a slot in the queue. `mySeq` lets us detect if a newer switch was
+  // enqueued behind us while we waited for earlier ones to finish.
+  const mySeq = ++switchSeq
+  const prior = activeSwitchPromise
+
+  const run = async (): Promise<void> => {
+    // Supersession: another switch was requested after this one while we were
+    // waiting our turn. That later request is the user's real intent, so drop
+    // this stale load instead of spinning up an engine the next switch would
+    // immediately tear down (root of the MLX-then-drop race on manual picks).
+    if (mySeq !== switchSeq) {
+      console.log(
+        '[switchToModel] Superseded by a newer switch, skipping:',
+        params.modelId,
+        'provider:',
+        params.providerName
+      )
+      return
     }
+
+    if (await isTargetModelAlreadyServing(params)) {
+      const activeModels = await params.serviceHub
+        .models()
+        .getActiveModels()
+        .catch(() => [] as string[])
+
+      useAppState.getState().setServerStatus('running')
+      // getActiveModels() is local-engine only; preserve any cloud model that
+      // is already "active" in the UI so re-selecting the same cloud target
+      // does not wipe out the global active-model state.
+      syncActiveModelsFromEngines(activeModels || [])
+      syncModelSelection(params.providerName, params.modelId)
+      // WS2: the target is healthy — clear any prior auto-start failure record.
+      clearAutoStartFailure(params.providerName, params.modelId)
+      // ATO-63: the model is up — drop any stale "Failed to load" toast.
+      clearModelLoadError()
+      maybePromptTurboquantOptimal(params.providerName)
+      console.log(
+        '[switchToModel] Target already active, skipping restart:',
+        params.modelId,
+        'provider:',
+        params.providerName
+      )
+      return
+    }
+
+    await doSwitchToModel(params)
   }
 
-  if (await isTargetModelAlreadyServing(params)) {
-    const activeModels = await params.serviceHub
-      .models()
-      .getActiveModels()
-      .catch(() => [] as string[])
-
-    useAppState.getState().setServerStatus('running')
-    // getActiveModels() is local-engine only; preserve any cloud model that
-    // is already "active" in the UI so re-selecting the same cloud target
-    // does not wipe out the global active-model state.
-    syncActiveModelsFromEngines(activeModels || [])
-    syncModelSelection(params.providerName, params.modelId)
-    // WS2: the target is healthy — clear any prior auto-start failure record.
-    clearAutoStartFailure(params.providerName, params.modelId)
-    // ATO-63: the model is up — drop any stale "Failed to load" toast.
-    clearModelLoadError()
-    maybePromptTurboquantOptimal(params.providerName)
-    console.log(
-      '[switchToModel] Target already active, skipping restart:',
-      params.modelId,
-      'provider:',
-      params.providerName
-    )
-    return
-  }
-
-  const promise = doSwitchToModel(params)
-  activeSwitchPromise = promise
+  // Chain strictly after any in-flight/queued switch. A prior failure must not
+  // break the chain, so swallow it and still run ours.
+  const chained = (prior ?? Promise.resolve()).then(run, run)
+  activeSwitchPromise = chained
   try {
-    await promise
+    await chained
   } finally {
-    if (activeSwitchPromise === promise) {
+    // Only clear the tail if nobody chained after us; otherwise the later
+    // switch owns the tail and must keep the queue intact.
+    if (activeSwitchPromise === chained) {
       activeSwitchPromise = null
     }
   }
@@ -355,8 +430,9 @@ async function doSwitchToModel(params: {
   modelId: string
   providerName: string
   serviceHub: ServiceHub
+  isAutoStart?: boolean
 }): Promise<void> {
-  const { modelId, providerName, serviceHub } = params
+  const { modelId, providerName, serviceHub, isAutoStart } = params
 
   const { setServerStatus, setActiveModels, updateLoadingModel } =
     useAppState.getState()
@@ -404,7 +480,11 @@ async function doSwitchToModel(params: {
     if (isLocal) {
       // 4a. Local branch — load the model into its engine.
       loadStartTs = Date.now()
-      await serviceHub.models().startModel(provider, modelId, true)
+      await taggedWithTimeout(
+        serviceHub.models().startModel(provider, modelId, true),
+        MODEL_LOAD_WATCHDOG_MS,
+        `Timed out waiting for model "${modelId}" to finish loading.`
+      )
       emitModelLoad('success', {
         modelId,
         providerName,
@@ -416,7 +496,7 @@ async function doSwitchToModel(params: {
     } else {
       // 4b. Cloud branch — register the provider so the proxy can route
       //     requests for `modelId` to provider.base_url.
-      if (!provider.api_key) {
+      if (!provider.api_key && !isKeylessRemoteProvider(provider)) {
         throw new Error(
           `Provider '${providerName}' has no API key. Add one in Settings before selecting this model.`
         )
@@ -437,7 +517,7 @@ async function doSwitchToModel(params: {
     //    Mirrors the same handling in hermes-agent.tsx / claude-code.tsx.
     let actualPort: number | undefined
     try {
-      actualPort = await window.core?.api?.startServer({
+      const startServerCall = window.core?.api?.startServer({
         host: serverState.serverHost,
         port: serverState.serverPort,
         prefix: serverState.apiPrefix,
@@ -446,12 +526,20 @@ async function doSwitchToModel(params: {
         isCorsEnabled: serverState.corsEnabled,
         isVerboseEnabled: serverState.verboseLogs,
         proxyTimeout: serverState.proxyTimeout,
-      })
+      }) as Promise<number> | undefined
+      actualPort = startServerCall
+        ? await taggedWithTimeout(
+            startServerCall,
+            SERVER_START_WATCHDOG_MS,
+            'Timed out waiting for the Local API Server to start.'
+          )
+        : undefined
     } catch (startErr) {
       const msg =
         startErr instanceof Error ? startErr.message : String(startErr)
       if (!msg.includes('already running')) throw startErr
     }
+    
     console.log('[switchToModel] Server started on port:', actualPort)
 
     if (actualPort && actualPort !== serverState.serverPort) {
@@ -533,7 +621,7 @@ async function doSwitchToModel(params: {
         )
       }
     }
-    reportModelLoadError(error, providerName)
+    reportModelLoadError(error, providerName, isAutoStart, modelId)
     throw error
   } finally {
     useAppState.getState().updateLoadingModel(false)
@@ -614,15 +702,38 @@ function unsupportedDescription(
  * Surface a user-visible banner when a model fails to load.
  * OOM errors get a persistent toast so the user cannot miss them.
  */
-function reportModelLoadError(rawError: unknown, providerName?: string): void {
+function reportModelLoadError(
+  rawError: unknown,
+  providerName?: string,
+  isAutoStart?: boolean,
+  modelId?: string
+): void {
   const err = toErrorObject(rawError)
-  useModelLoad.getState().setModelLoadError(err)
-
-  // During onboarding a crashed auto-start must not throw a raw stderr toast on
-  // the setup screen — keep the error in the store but skip the user-facing toast.
-  if (useModelLoad.getState().suppressErrorToast) return
+  useModelLoad.getState().setModelLoadError(err, modelId)
 
   const t = i18n.t.bind(i18n)
+
+  // ATO-270: a startup watchdog timeout must surface even on auto-start —
+  // the alternative is an infinite "Starting Server" spinner with zero
+  // feedback and no way for the user to know anything went wrong, let alone
+  // retry. This is the one exception to the "auto-start fails silently"
+  // policy below.
+  if (err.code === LOCAL_API_SERVER_START_TIMEOUT_CODE) {
+    toast.error(t('model-errors:startupTimedOutTitle'), {
+      id: 'model-load-error',
+      description: t('model-errors:startupTimedOutDescription'),
+      duration: 10000,
+      closeButton: true,
+    })
+    return
+  }
+
+  // Only user-initiated loads surface a toast for every other failure.
+  // Automatic/background loads (startup auto-start, ChatInput auto-start,
+  // onboarding launches, post-import auto-switch) pass `isAutoStart` and
+  // fail silently — the error is still stored above for any inline UI that
+  // wants to read it.
+  if (isAutoStart) return
 
   if (isOutOfMemoryError(err)) {
     toast.error(t('model-errors:outOfMemoryTitle'), {

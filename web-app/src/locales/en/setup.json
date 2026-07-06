@@ -15,6 +15,7 @@
   "skip": "Skip",
   "modelUnavailable": "Not in catalog yet — open Hub after connection.",
   "localStep": {
+    "onDeviceTitle": "On your device",
     "titleOne": "Found 1 model on your machine",
     "titleOther": "Found {{count}} models on your machine",
     "descriptionOne": "This model is already downloaded by another app. Run it here instantly — no re-download.",

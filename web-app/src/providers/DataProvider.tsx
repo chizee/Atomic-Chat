@@ -18,7 +18,16 @@ import { useLocalApiServer } from '@/hooks/useLocalApiServer'
 import { useAppState } from '@/hooks/useAppState'
 import { useAppUpdater } from '@/hooks/useAppUpdater'
 import { switchToModel } from '@/utils/switchModel'
-import { isDev, LOCAL_LLAMACPP_PROVIDER } from '@/lib/utils'
+import { useModelLoad } from '@/hooks/useModelLoad'
+import { isOnboardingPending } from '@/lib/onboarding'
+import { ensureRegistryLoaded } from '@/stores/provider-registry-store'
+import { consumeSilentImport } from '@/utils/backgroundImports'
+import {
+  isDev,
+  LOCAL_LLAMACPP_PROVIDER,
+  SERVER_START_WATCHDOG_MS,
+  withTimeout,
+} from '@/lib/utils'
 import { AppEvent, events, ModelEvent } from '@janhq/core'
 import { toast } from 'sonner'
 import { SystemEvent } from '@/types/events'
@@ -27,6 +36,7 @@ import {
   type AtomicChatDeepLinkTarget,
 } from '@/services/deeplink/parse'
 import {
+  isKeylessRemoteProvider,
   isLocalProvider,
   registerRemoteProvider,
   unregisterRemoteProvider,
@@ -60,7 +70,7 @@ const syncRemoteProviders = () => {
     if (
       provider.active &&
       !isLocalProvider(provider.provider) &&
-      provider.api_key
+      (provider.api_key || isKeylessRemoteProvider(provider))
     ) {
       safeRegisterRemoteProvider(provider)
       currentActive.add(provider.provider)
@@ -275,6 +285,30 @@ export function DataProvider() {
         return
       }
 
+      // Background bulk-imports (onboarding adds every detected model to the
+      // library by design) emit `onModelImported` too. Auto-switching to them
+      // would hijack the model the user actually picked. This registry is
+      // independent of any screen lifecycle, so it also covers imports that
+      // settle AFTER the onboarding screen unmounts (when `onboardingActive` is
+      // already false again).
+      if (consumeSilentImport(modelId)) {
+        console.log(
+          '[LocalAPI] onModelImported: silent (background) import, skipping auto-switch for',
+          modelId
+        )
+        return
+      }
+
+      // While onboarding is on screen it launches the chosen model itself, so
+      // DataProvider stands down entirely to avoid double-launching it.
+      if (useModelLoad.getState().onboardingActive) {
+        console.log(
+          '[LocalAPI] onModelImported: onboarding active, skipping auto-switch for',
+          modelId
+        )
+        return
+      }
+
       // Resolve the provider against the *post-setProviders* store, not the
       // raw `getProviders()` payload. On Windows the store strips the
       // turboquant `'llamacpp'` provider (ADR 2026-05-22 *Windows ships only
@@ -348,6 +382,7 @@ export function DataProvider() {
           modelId,
           providerName,
           serviceHub,
+          isAutoStart: true,
         })
         console.log('[LocalAPI] Model imported and switched to:', modelId)
       } catch (error) {
@@ -641,6 +676,14 @@ export function DataProvider() {
         const fetchedProviders = await serviceHub.providers().getProviders()
         setProviders(fetchedProviders)
         const allProviders = useModelProvider.getState().providers
+
+        await ensureRegistryLoaded()
+        if (isOnboardingPending(allProviders)) {
+          console.log(
+            '[LocalAPI:startup] Onboarding pending; skipping startup auto-start'
+          )
+          return
+        }
         const localModels = allProviders
           .filter(
             (p) =>
@@ -749,14 +792,21 @@ export function DataProvider() {
         // Cloud provider without an API key cannot be registered with the
         // proxy, so we just bring the server up bare and leave the UI to
         // show "no active model". The user must add an API key in Settings.
-        if (isCloud && !candidateProvider?.api_key) {
+        if (
+          isCloud &&
+          !candidateProvider?.api_key &&
+          !isKeylessRemoteProvider(candidateProvider)
+        ) {
           console.log(
             '[LocalAPI:startup] Cloud provider selected without API key, raising bare server:',
             modelToStart.provider
           )
           setServerStatus('pending')
           try {
-            const actualPort = await window.core?.api?.startServer({
+            // ATO-270: never let a stuck native invoke leave the UI on
+            // "Starting Server" forever — see the watchdog note next to
+            // `switchToModel` for why this needs a ceiling at all.
+            const startServerCall = window.core?.api?.startServer({
               host: serverState.serverHost,
               port: serverState.serverPort,
               prefix: serverState.apiPrefix,
@@ -765,7 +815,14 @@ export function DataProvider() {
               isCorsEnabled: serverState.corsEnabled,
               isVerboseEnabled: serverState.verboseLogs,
               proxyTimeout: serverState.proxyTimeout,
-            })
+            }) as Promise<number> | undefined
+            const actualPort = startServerCall
+              ? await withTimeout(
+                  startServerCall,
+                  SERVER_START_WATCHDOG_MS,
+                  'Timed out waiting for the Local API Server to start.'
+                )
+              : undefined
             if (actualPort && actualPort !== serverState.serverPort) {
               serverState.setServerPort(actualPort)
             }
@@ -790,6 +847,7 @@ export function DataProvider() {
           modelId: modelToStart.model,
           providerName: modelToStart.provider,
           serviceHub,
+          isAutoStart: true,
         })
       } catch (error) {
         console.error('[LocalAPI:startup] Failed to auto-start server:', error)

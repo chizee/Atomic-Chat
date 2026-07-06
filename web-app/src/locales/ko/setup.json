@@ -15,6 +15,7 @@
   "skip": "건너뛰기",
   "modelUnavailable": "아직 카탈로그에 없습니다 — 연결 후 허브를 여세요.",
   "localStep": {
+    "onDeviceTitle": "내 기기에 있음",
     "titleOne": "기기에서 모델 1개를 찾았습니다",
     "titleOther": "기기에서 모델 {{count}}개를 찾았습니다",
     "descriptionOne": "다른 앱에서 이미 다운로드한 모델입니다. 다시 받지 않고 여기서 바로 실행하세요.",

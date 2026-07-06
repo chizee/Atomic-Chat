@@ -64,6 +64,10 @@ import {
   gemmaMtpDraftUrl,
   type GemmaMtpDraft,
 } from './gemmaMtpRegistry'
+import {
+  resolveLlama3TemplateOverride,
+  STRICT_SYSTEM_GUARD_SIGNATURE,
+} from './chatTemplateOverrides'
 import { basename } from '@tauri-apps/api/path'
 import { getSystemUsage, getSystemInfo } from './hardware'
 import {
@@ -170,6 +174,16 @@ function modelLoadReadyTimeoutSecs(configuredTimeoutSecs: number): number {
   const base = Number.isFinite(configured) && configured > 0 ? configured : 600
   return Math.max(base, MODEL_LOAD_READY_TIMEOUT_FLOOR_SECS)
 }
+
+/// Temporary hard pin: every launch forcibly reconciles `version_backend`
+/// to this exact ggml-org tag, preserving the user's backend *type*
+/// (cpu/cuda/vulkan/macos-arm64) but never their *version* — this WILL
+/// downgrade a newer manually-installed backend just as readily as it
+/// upgrades an older one. Mirrors the CI/build pins in `Makefile`
+/// (`LLAMACPP_UPSTREAM_TAG`) and `atomic-chat-conf/backends/manifest.json`
+/// (`tag_name`). Remove (or move to a real settings-driven pin) once the
+/// team is done validating this tag broadly. See `enforcePinnedBackendVersion`.
+const PINNED_BACKEND_TAG = 'b9881'
 
 /**
  * Override the default app.log function to use Jan's logging system.
@@ -571,6 +585,11 @@ export default class llamacpp_upstream_extension extends AIEngine {
         //! Раньше отклонённый промис терялся; без лога сложно понять вечный «loading» в настройках.
         logger.error('configureBackends failed:', err)
       })
+      // Runs after every launch resolves a concrete `version_backend`, to
+      // forcibly reconcile it to `PINNED_BACKEND_TAG`. Chained onto the
+      // same promise so callers awaiting `configureBackendsPromise` also
+      // observe the pin before touching the backend.
+      .then(() => this.enforcePinnedBackendVersion())
       .finally(() => {
         this.isInitializing = false
         this.configureBackendsPromise = null
@@ -1337,6 +1356,52 @@ export default class llamacpp_upstream_extension extends AIEngine {
     }
   }
 
+  /**
+   * Forcibly reconciles the active backend to `PINNED_BACKEND_TAG`,
+   * preserving the user's current backend *type* (cpu/cuda/vulkan/
+   * macos-arm64) — never their version. Runs once per launch, after
+   * `configureBackends()` has resolved a concrete `version_backend`.
+   *
+   * This is a hard pin: it downgrades a newer manually-installed backend
+   * just as readily as it upgrades an older one. If the pinned tag has no
+   * asset for the user's current type (e.g. a type removed upstream), the
+   * download/hot-swap fails and is logged, leaving the working backend
+   * untouched rather than bricking the install.
+   */
+  private async enforcePinnedBackendVersion(): Promise<void> {
+    try {
+      const current = stripBom(this.config.version_backend || '')
+      if (!isConcreteVersionBackend(current)) {
+        logger.info(
+          'enforcePinnedBackendVersion: no concrete backend configured yet, skipping'
+        )
+        return
+      }
+
+      const slashIdx = current.indexOf('/')
+      const currentTag = current.slice(0, slashIdx)
+      const currentType = current.slice(slashIdx + 1)
+
+      if (currentTag === PINNED_BACKEND_TAG) {
+        return
+      }
+
+      const target = `${PINNED_BACKEND_TAG}/${currentType}`
+      logger.info(
+        `enforcePinnedBackendVersion: pinning backend '${current}' -> '${target}'`
+      )
+      await this.downloadRecommendedBackend(target)
+      logger.info(
+        `enforcePinnedBackendVersion: backend pinned to '${target}'`
+      )
+    } catch (err) {
+      logger.error(
+        'enforcePinnedBackendVersion: failed to pin backend version (keeping current backend):',
+        err
+      )
+    }
+  }
+
   private async determineBestBackend(
     version_backends: { version: string; backend: string }[]
   ): Promise<string> {
@@ -1899,16 +1964,29 @@ export default class llamacpp_upstream_extension extends AIEngine {
   }
 
   /**
-   * Apply a freshly-downloaded backend to the running process: stop any
-   * loaded llama.cpp models, swap `version_backend` via `updateBackend()`,
-   * clear the pending marker, and notify the UI via a window event.
+   * Apply a freshly-downloaded backend to the running process: swap
+   * `version_backend` via `updateBackend()` first, then stop any loaded
+   * llama.cpp models, clear the pending marker, and notify the UI via a
+   * window event.
+   *
+   * Order matters: `updateBackend()` must commit the new `version_backend`
+   * into `this.config` *before* any model is unloaded. Unloading flips the
+   * model's status to stopped, which the web-app's local-model auto-start
+   * effect (`ChatInput.tsx`) reacts to by immediately reloading it via
+   * `switchToModel()`. `performLoad()` snapshots `this.config` synchronously
+   * at call time, so an unload-before-update ordering let that auto-reload
+   * race ahead of `updateBackend()` and respawn `llama-server` against the
+   * *old* backend — the UI would then report the switch as complete while
+   * the running process silently stayed on the previous (e.g. CPU) build.
    *
    * Failure modes:
+   *   - `updateBackend()` throws → we propagate without touching any loaded
+   *     model, so a failed hot-swap never kills a working session. Caller
+   *     leaves the pending marker in place so `activatePendingBackend()`
+   *     retries on next launch.
    *   - `unload()` throws when a session can't be cleanly stopped → we log
-   *     and continue, because `updateBackend()` only mutates settings and
-   *     does not require an empty session table.
-   *   - `updateBackend()` throws → we propagate. Caller leaves the pending
-   *     marker in place so `activatePendingBackend()` retries on next launch.
+   *     and continue; the new backend is already persisted, so the next
+   *     load (auto or manual) picks it up regardless.
    */
   private async applyBackendLive(backendString: string): Promise<void> {
     let loaded: string[] = []
@@ -1916,6 +1994,13 @@ export default class llamacpp_upstream_extension extends AIEngine {
       loaded = await this.getLoadedModels()
     } catch (err) {
       logger.warn('applyBackendLive: getLoadedModels failed (continuing):', err)
+    }
+
+    const result = await this.updateBackend(backendString)
+    if (!result.wasUpdated) {
+      throw new Error(
+        `updateBackend reported wasUpdated=false for ${backendString}`
+      )
     }
 
     for (const modelId of loaded) {
@@ -1927,13 +2012,6 @@ export default class llamacpp_upstream_extension extends AIEngine {
           err
         )
       }
-    }
-
-    const result = await this.updateBackend(backendString)
-    if (!result.wasUpdated) {
-      throw new Error(
-        `updateBackend reported wasUpdated=false for ${backendString}`
-      )
     }
 
     localStorage.removeItem('llama_cpp_pending_backend')
@@ -3680,6 +3758,37 @@ export default class llamacpp_upstream_extension extends AIEngine {
     // (or mmproj) file is missing or incomplete on disk, instead of spawning
     // llama-server only for it to crash with an opaque truncated-path error.
     await this.validateModelArtifacts(modelConfig, modelPath, mmprojPath)
+
+    // Llama 3.x `--jinja` auto-parser fix: the unsloth conversions embed a
+    // strict `raise_exception('System message must be at the beginning')`
+    // guard that the auto-parser's synthetic probes trip, failing parser
+    // generation with `400 Unable to generate parser`. Substitute the
+    // canonical Meta Llama 3.x template (no such guard) only when the user
+    // hasn't set an explicit chat_template.
+    if (!cfg.chat_template?.trim()) {
+      try {
+        const embedded = (await readGgufMetadata(modelPath))?.metadata?.[
+          'tokenizer.chat_template'
+        ] as string | undefined
+        const override = resolveLlama3TemplateOverride(modelId, embedded)
+        if (override) {
+          cfg.chat_template = override
+          logger.warn(
+            `[performLoad] Overriding strict embedded chat_template for "${modelId}" with the canonical Meta Llama 3.x template (auto-parser-safe).`
+          )
+        } else if (embedded?.includes(STRICT_SYSTEM_GUARD_SIGNATURE)) {
+          logger.warn(
+            `[performLoad] Model "${modelId}" has a strict system-message guard in its embedded chat_template but is not a recognized Llama 3.x format; leaving the template untouched.`
+          )
+        }
+      } catch (e) {
+        logger.warn(
+          `[performLoad] chat_template override probe failed for "${modelId}": ${
+            e instanceof Error ? e.message : String(e)
+          }`
+        )
+      }
+    }
 
     // Gemma 4 MTP: the draft head is a separate GGUF keyed to the loaded
     // target, so resolve it lazily here rather than only at toggle time. If

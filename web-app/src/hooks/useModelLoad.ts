@@ -2,15 +2,24 @@ import { create } from 'zustand'
 
 type ModelLoadState = {
   modelLoadError?: string | ErrorObject
-  setModelLoadError: (error: string | ErrorObject | undefined) => void
-  // Onboarding turns this on so a failed auto-start can't pop a crash toast over the setup screen.
-  suppressErrorToast: boolean
-  setSuppressErrorToast: (value: boolean) => void
+  // Which model `modelLoadError` belongs to (the error carries no id).
+  modelLoadErrorModelId?: string
+  setModelLoadError: (
+    error: string | ErrorObject | undefined,
+    modelId?: string
+  ) => void
+  onboardingActive: boolean
+  setOnboardingActive: (value: boolean) => void
 }
 
 export const useModelLoad = create<ModelLoadState>()((set) => ({
   modelLoadError: undefined,
-  setModelLoadError: (error) => set({ modelLoadError: error }),
-  suppressErrorToast: false,
-  setSuppressErrorToast: (value) => set({ suppressErrorToast: value }),
+  modelLoadErrorModelId: undefined,
+  setModelLoadError: (error, modelId) =>
+    set({
+      modelLoadError: error,
+      modelLoadErrorModelId: error ? modelId : undefined,
+    }),
+  onboardingActive: false,
+  setOnboardingActive: (value) => set({ onboardingActive: value }),
 }))

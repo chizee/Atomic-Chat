@@ -336,16 +336,24 @@ const DropdownModelProvider = memo(function DropdownModelProvider({
     const groups: Record<string, SearchableModel[]> = {}
 
     if (!searchValue) {
-      // When not searching, show all active providers (even without models)
-      // Sort: local first, then providers with API keys or custom with models, then others, alphabetically
+      const isLocalProvider = (name: string) =>
+        name === 'mlx' ||
+        name === 'llamacpp' ||
+        name === 'llamacpp-upstream' ||
+        name === 'foundation-models'
+
       const activeProviders = providers
         .filter((p) => p.active)
         .sort((a, b) => {
-          const aIsLocal = a.provider === 'llamacpp' || a.provider === 'mlx'
-          const bIsLocal = b.provider === 'llamacpp' || b.provider === 'mlx'
-          // Local (llamacpp) first
-          if (aIsLocal && !bIsLocal) return -1
-          if (!aIsLocal && bIsLocal) return 1
+          // Local providers first, regardless of whether they have models
+          const aIsLocal = isLocalProvider(a.provider)
+          const bIsLocal = isLocalProvider(b.provider)
+          if (aIsLocal !== bIsLocal) return aIsLocal ? -1 : 1
+
+          // Within the same group, non-empty providers first
+          const aHasModels = a.models.length > 0
+          const bHasModels = b.models.length > 0
+          if (aHasModels !== bHasModels) return aHasModels ? -1 : 1
 
           // Custom providers without API key but with models should be treated like "have API key"
           const aIsPredefined = isKnownProvider(a.provider)

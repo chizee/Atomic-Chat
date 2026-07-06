@@ -156,6 +156,7 @@ pub fn run() {
         core::system::commands::configure_goose,
         core::system::commands::configure_openhands,
         core::system::commands::configure_kilo,
+        core::system::commands::configure_poolside,
         core::system::commands::open_agent_terminal,
         core::system::commands::launch_editor,
         // Server commands
@@ -198,6 +199,7 @@ pub fn run() {
         core::updater::commands::is_update_available,
         // HTTP (bypasses tauri_plugin_http fetch interception)
         core::http::post_local_http,
+        core::http::get_local_http,
         core::http::stream_local_http,
         // HTML artifact preview (served via the artifact:// protocol)
         core::artifact::set_artifact_html,
@@ -275,6 +277,7 @@ pub fn run() {
         core::system::commands::configure_goose,
         core::system::commands::configure_openhands,
         core::system::commands::configure_kilo,
+        core::system::commands::configure_poolside,
         core::system::commands::open_agent_terminal,
         core::system::commands::launch_editor,
         // Server commands
@@ -366,6 +369,14 @@ pub fn run() {
             }
             #[cfg(any(target_os = "ios", target_os = "android"))]
             app.handle().plugin(log_builder.build())?;
+
+            // Reap backend processes orphaned by a previous *abnormal* exit
+            // (crash / OOM / Force Quit / SIGKILL — none of which run our
+            // RunEvent::Exit cleanup) before any engine spawns. Single-instance
+            // guarantees these can only be our own leftovers. Kept after logger
+            // init so its actions are recorded in app.log.
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            crate::core::process_reaper::reap_orphan_backends(app.handle());
 
             #[cfg(target_os = "windows")]
             {

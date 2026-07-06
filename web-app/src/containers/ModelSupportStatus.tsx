@@ -9,6 +9,7 @@ import {
 import { getJanDataFolderPath, joinPath, fs } from '@janhq/core'
 import { useServiceHub } from '@/hooks/useServiceHub'
 import { useAppState } from '@/hooks/useAppState'
+import { useModelLoad } from '@/hooks/useModelLoad'
 import { useShallow } from 'zustand/react/shallow'
 
 interface ModelSupportStatusProps {
@@ -34,12 +35,25 @@ export const ModelSupportStatus = ({
       loadingModel: state.loadingModel,
     }))
   )
+  const modelLoadError = useModelLoad((state) => state.modelLoadError)
+  const modelLoadErrorModelId = useModelLoad(
+    (state) => state.modelLoadErrorModelId
+  )
 
   // A running model works on this device regardless of the static ctx-size
   // estimate (the user may set ctx 16k but only ever reach 2k). Runtime
   // context overflow is surfaced separately via an error, so never show the
   // "doesn't work" red dot while the model is actually loaded.
   const isModelRunning = !!modelId && activeModels.includes(modelId)
+
+  // This model's load failed terminally — outranks the memory-fit estimate so
+  // a model that fits RAM but the backend can't parse isn't shown green.
+  const loadFailed =
+    !!modelId &&
+    modelLoadErrorModelId === modelId &&
+    !!modelLoadError &&
+    !loadingModel &&
+    !isModelRunning
 
   // Helper function to check model support with proper path resolution
   const checkModelSupportWithPath = useCallback(
@@ -122,6 +136,8 @@ export const ModelSupportStatus = ({
   }
 
   const getStatusTooltip = (): string => {
+    // Not a memory/ctx problem, so outrank the per-provider wording below.
+    if (loadFailed) return 'Model failed to load on this backend'
     if (provider === 'mlx') {
       switch (modelSupportStatus) {
         case 'GREEN':
@@ -166,6 +182,10 @@ export const ModelSupportStatus = ({
           setModelSupportStatus('GREEN')
           return
         }
+        if (loadFailed) {
+          setModelSupportStatus('RED')
+          return
+        }
         setModelSupportStatus('LOADING')
         try {
           const supportStatus = await checkModelSupportWithPath(
@@ -183,7 +203,14 @@ export const ModelSupportStatus = ({
     }
 
     checkModelSupport()
-  }, [modelId, provider, contextSize, checkModelSupportWithPath, activeModels])
+  }, [
+    modelId,
+    provider,
+    contextSize,
+    checkModelSupportWithPath,
+    activeModels,
+    loadFailed,
+  ])
 
   // Track MLX model running status (activeModels takes priority over loadingModel
   // to avoid showing "Starting…" when the model has already finished loading)
@@ -192,12 +219,14 @@ export const ModelSupportStatus = ({
 
     if (activeModels.includes(modelId)) {
       setModelSupportStatus('GREEN')
+    } else if (loadFailed) {
+      setModelSupportStatus('RED')
     } else if (loadingModel) {
       setModelSupportStatus('LOADING')
     } else {
       setModelSupportStatus('GREY')
     }
-  }, [provider, modelId, loadingModel, activeModels])
+  }, [provider, modelId, loadingModel, activeModels, loadFailed])
 
   if (
     !modelSupportStatus ||

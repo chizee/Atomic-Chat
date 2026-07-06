@@ -127,6 +127,80 @@ describe('Backend functions', () => {
     })
   })
 
+  describe('isBackendInstalled (Windows DLL completeness check)', () => {
+    afterEach(() => {
+      vi.stubGlobal('IS_WINDOWS', false)
+    })
+
+    it('returns true on Windows when the exe and at least one DLL are present', async () => {
+      vi.stubGlobal('IS_WINDOWS', true)
+      const exeDir = `${MOCK_JAN_PATH_STRING}/llamacpp/backends/v1.0.0/windows-x64-cpu/build/bin`
+      vi.mocked(fs.existsSync).mockImplementation(async (path: string) => {
+        if (path.endsWith('/build')) return true
+        return path === `${exeDir}/llama-server.exe`
+      })
+      vi.mocked(fs.readdirSync).mockResolvedValue([
+        `${exeDir}/llama-server.exe`,
+        `${exeDir}/llama-server-impl.dll`,
+        `${exeDir}/ggml-cpu.dll`,
+      ])
+
+      const result = await isBackendInstalled('windows-x64-cpu', 'v1.0.0')
+      expect(result).toBe(true)
+    })
+
+    it('returns false on Windows when the exe exists but no DLLs are alongside it (broken install)', async () => {
+      vi.stubGlobal('IS_WINDOWS', true)
+      const exeDir = `${MOCK_JAN_PATH_STRING}/llamacpp/backends/v1.0.0/windows-x64-cpu/build/bin`
+      vi.mocked(fs.existsSync).mockImplementation(async (path: string) => {
+        if (path.endsWith('/build')) return true
+        return path === `${exeDir}/llama-server.exe`
+      })
+      // Only the exe was relocated into build/bin - CI packaging regression,
+      // its dependency DLLs never made it (the root cause this check exists for)
+      vi.mocked(fs.readdirSync).mockResolvedValue([`${exeDir}/llama-server.exe`])
+
+      const result = await isBackendInstalled('windows-x64-cpu', 'v1.0.0')
+      expect(result).toBe(false)
+    })
+
+    it('does not check for DLLs on non-Windows platforms', async () => {
+      vi.stubGlobal('IS_WINDOWS', false)
+      const exeDir = `${MOCK_JAN_PATH_STRING}/llamacpp/backends/v1.0.0/linux-x64-vulkan/build/bin`
+      vi.mocked(fs.existsSync).mockImplementation(async (path: string) => {
+        if (path.endsWith('/build')) return true
+        return path === `${exeDir}/llama-server`
+      })
+      vi.mocked(fs.readdirSync).mockResolvedValue([`${exeDir}/llama-server`])
+
+      const result = await isBackendInstalled('linux-x64-vulkan', 'v1.0.0')
+      expect(result).toBe(true)
+      expect(fs.readdirSync).not.toHaveBeenCalled()
+    })
+
+    it('fails open (treats as installed) when the directory cannot be enumerated', async () => {
+      vi.stubGlobal('IS_WINDOWS', true)
+      const exeDir = `${MOCK_JAN_PATH_STRING}/llamacpp/backends/v1.0.0/windows-x64-cpu/build/bin`
+      vi.mocked(fs.existsSync).mockImplementation(async (path: string) => {
+        if (path.endsWith('/build')) return true
+        return path === `${exeDir}/llama-server.exe`
+      })
+      vi.mocked(fs.readdirSync).mockRejectedValue(new Error('permission denied'))
+
+      const result = await isBackendInstalled('windows-x64-cpu', 'v1.0.0')
+      expect(result).toBe(true)
+    })
+
+    it('returns false without checking DLLs when the exe itself is missing', async () => {
+      vi.stubGlobal('IS_WINDOWS', true)
+      vi.mocked(fs.existsSync).mockResolvedValue(false)
+
+      const result = await isBackendInstalled('windows-x64-cpu', 'v1.0.0')
+      expect(result).toBe(false)
+      expect(fs.readdirSync).not.toHaveBeenCalled()
+    })
+  })
+
   describe('getBackendDownloadUrl (TurboQuant manifest)', () => {
     afterEach(() => {
       vi.stubGlobal('IS_WINDOWS', false)

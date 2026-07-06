@@ -35,6 +35,7 @@ Default permissions for the llamacpp plugin
 - `allow-should-migrate-backend`
 - `allow-handle-setting-update`
 - `allow-install-bundled-backend`
+- `allow-fetch-manifest-http1`
 
 ## Permission Table
 
@@ -145,6 +146,32 @@ Enables the estimate_kv_cache_size command without any pre-configured scope.
 <td>
 
 Denies the estimate_kv_cache_size command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`llamacpp-upstream:allow-fetch-manifest-http1`
+
+</td>
+<td>
+
+Enables the fetch_manifest_http1 command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`llamacpp-upstream:deny-fetch-manifest-http1`
+
+</td>
+<td>
+
+Denies the fetch_manifest_http1 command without any pre-configured scope.
 
 </td>
 </tr>

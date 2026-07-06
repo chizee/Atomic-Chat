@@ -46,6 +46,10 @@ import {
 import { basename } from '@tauri-apps/api/path'
 import { getSystemUsage, getSystemInfo } from './hardware'
 import {
+  resolveLlama3TemplateOverride,
+  STRICT_SYSTEM_GUARD_SIGNATURE,
+} from './chatTemplateOverrides'
+import {
   loadLlamaModel,
   readGgufMetadata,
   getModelSize,
@@ -2800,6 +2804,37 @@ export default class llamacpp_extension extends AIEngine {
     // (or mmproj) file is missing or incomplete on disk, instead of spawning
     // llama-server only for it to crash with an opaque truncated-path error.
     await this.validateModelArtifacts(modelConfig, modelPath, mmprojPath)
+
+    // Llama 3.x `--jinja` auto-parser fix: the unsloth conversions embed a
+    // strict `raise_exception('System message must be at the beginning')`
+    // guard that the auto-parser's synthetic probes trip, failing parser
+    // generation with `400 Unable to generate parser`. Substitute the
+    // canonical Meta Llama 3.x template (no such guard) only when the user
+    // hasn't set an explicit chat_template.
+    if (!cfg.chat_template?.trim()) {
+      try {
+        const embedded = (await readGgufMetadata(modelPath))?.metadata?.[
+          'tokenizer.chat_template'
+        ] as string | undefined
+        const override = resolveLlama3TemplateOverride(modelId, embedded)
+        if (override) {
+          cfg.chat_template = override
+          logger.warn(
+            `[performLoad] Overriding strict embedded chat_template for "${modelId}" with the canonical Meta Llama 3.x template (auto-parser-safe).`
+          )
+        } else if (embedded?.includes(STRICT_SYSTEM_GUARD_SIGNATURE)) {
+          logger.warn(
+            `[performLoad] Model "${modelId}" has a strict system-message guard in its embedded chat_template but is not a recognized Llama 3.x format; leaving the template untouched.`
+          )
+        }
+      } catch (e) {
+        logger.warn(
+          `[performLoad] chat_template override probe failed for "${modelId}": ${
+            e instanceof Error ? e.message : String(e)
+          }`
+        )
+      }
+    }
 
     if (!this.modelMaxCtxTrain.has(modelId)) {
       const max = await this.resolveModelMaxCtxTrain(modelPath)

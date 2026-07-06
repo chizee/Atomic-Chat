@@ -1,6 +1,6 @@
 import { EMBEDDING_MODEL_ID } from '@/constants/models'
 import TextareaAutosize from 'react-textarea-autosize'
-import { cn, formatBytes, LOCAL_LLAMACPP_PROVIDER } from '@/lib/utils'
+import { cn, formatBytes, LOCAL_LLAMACPP_PROVIDER, isLlamacppProvider } from '@/lib/utils'
 import { usePrompt } from '@/hooks/usePrompt'
 import { useThreads } from '@/hooks/useThreads'
 import { useCallback, useEffect, useMemo, useRef, useState, memo } from 'react'
@@ -34,6 +34,7 @@ import { useGeneralSetting } from '@/hooks/useGeneralSetting'
 import { useModelProvider } from '@/hooks/useModelProvider'
 
 import { useAppState } from '@/hooks/useAppState'
+import { useModelLoad } from '@/hooks/useModelLoad'
 import { syncActiveModelsFromEngines } from '@/utils/activeModelsSync'
 import type { ChatStatus } from 'ai'
 import { useRouter } from '@tanstack/react-router'
@@ -251,6 +252,7 @@ const ChatInput = memo(function ChatInput({
           modelId: selectedModel.id,
           providerName: selectedProvider,
           serviceHub,
+          isAutoStart: true,
         })
       } catch (err) {
         console.warn('Failed to auto-start local model:', err)
@@ -278,6 +280,11 @@ const ChatInput = memo(function ChatInput({
     isModelActive,
   ])
 
+  const modelLoadError = useModelLoad((state) => state.modelLoadError)
+  const modelLoadErrorModelId = useModelLoad(
+    (state) => state.modelLoadErrorModelId
+  )
+
   const isLocalModelNotReady =
     (selectedProvider === 'mlx' ||
       selectedProvider === 'llamacpp' ||
@@ -285,7 +292,17 @@ const ChatInput = memo(function ChatInput({
     !!selectedModel?.id &&
     !activeModels.includes(selectedModel.id)
 
-  const blockSendUntilModelReady = isLocalModelNotReady && !!onSubmit
+  // Block sending (incl. the home screen, where onSubmit is undefined) the
+  // instant the selected model's load fails; !loadingModel keeps a merely
+  // starting model sendable.
+  const selectedModelLoadFailed =
+    isLocalModelNotReady &&
+    !loadingModel &&
+    !!modelLoadError &&
+    modelLoadErrorModelId === selectedModel?.id
+
+  const blockSendUntilModelReady =
+    (isLocalModelNotReady && !!onSubmit) || selectedModelLoadFailed
 
   const selectedAssistant = useAssistant((state) => state.pendingAssistant)
   const setSelectedAssistant = useAssistant(
@@ -2540,7 +2557,7 @@ const ChatInput = memo(function ChatInput({
             </div>
 
             <div className="flex items-center gap-2">
-              {selectedProvider === 'llamacpp' &&
+              {isLlamacppProvider(selectedProvider) &&
                 tokenCounterCompact &&
                 !effectiveAgentMode &&
                 !initialMessage &&
@@ -2612,7 +2629,7 @@ const ChatInput = memo(function ChatInput({
         </div>
       )}
 
-      {selectedProvider === 'llamacpp' &&
+      {isLlamacppProvider(selectedProvider) &&
         isModelActive &&
         !effectiveAgentMode &&
         !tokenCounterCompact &&

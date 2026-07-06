@@ -97,6 +97,16 @@ pub async fn load_llama_model_impl(
 
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
+    // Kill the spawned llama-server if this load future is dropped before the
+    // child is handed off to the tracked `process_map` (e.g. a rapid model
+    // switch or onboarding retry supersedes/cancels an in-flight load). Without
+    // this, tokio leaves the process running: it never enters `process_map`, so
+    // neither `stop`/`stop_all` nor `cleanup_processes` (which only act on the
+    // map) can ever reap it — orphaned `llama-server` instances then pile up and
+    // hold ports/RAM until the user kills them by hand. Once the child *is*
+    // inserted into the map it is owned there (not dropped), so healthy sessions
+    // keep running normally.
+    command.kill_on_drop(true);
     setup_windows_process_flags(&mut command);
 
     // Try to add CUDA paths (works on both Windows and Linux)
