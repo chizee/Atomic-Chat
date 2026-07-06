@@ -350,6 +350,9 @@ const RECOVERABLE_MODEL_LOAD_CODES = new Set<string>([
   'MODEL_FILE_CORRUPT',
   'BINARY_NOT_FOUND',
   'MULTIMODAL_PROJECTOR_LOAD_FAILED',
+  // A model whose architecture/format this engine build can't parse (e.g. a
+  // newer qwen3vl GGUF). A deterministic incompatibility, not a backend crash.
+  'MODEL_ARCH_NOT_SUPPORTED',
   // ATO-190: deterministic environment incompatibility (macOS too old for the
   // bundled Metal engine), not a code crash — don't flood the crash channel.
   'OS_VERSION_UNSUPPORTED',

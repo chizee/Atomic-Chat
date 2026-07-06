@@ -57,6 +57,7 @@ import { useAppState } from '@/hooks/useAppState'
 import { ExtensionManager } from '@/lib/extension'
 import { ExtensionTypeEnum, VectorDBExtension } from '@janhq/core'
 import { ttftMark } from '@/lib/ttft-timing'
+import { extractModelErrorMessage } from '@/lib/modelErrorMessage'
 
 /// Local inference backends (mlx, llamacpp, llamacpp-upstream,
 /// foundation-models) get special handling at the `streamText` boundary:
@@ -623,7 +624,7 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
       } catch (error) {
         console.error('Failed to create model:', error)
         throw new Error(
-          `Failed to create model: ${error instanceof Error ? error.message : JSON.stringify(error)}`
+          `Failed to create model: ${extractModelErrorMessage(error)}`
         )
       }
     } else {

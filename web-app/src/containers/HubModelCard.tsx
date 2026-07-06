@@ -250,10 +250,13 @@ export function HubModelCard({
                   {t('hub:by')} {model.developer}
                 </span>
               )}
-              <span className="inline-flex items-center gap-1.5">
-                <IconDownload size={14} className="text-muted-foreground" />
-                {formatDownloads(model.downloads)}
-              </span>
+              {/* Imported models carry no HF download count — hide the "0". */}
+              {!!model.downloads && model.downloads > 0 && (
+                <span className="inline-flex items-center gap-1.5">
+                  <IconDownload size={14} className="text-muted-foreground" />
+                  {formatDownloads(model.downloads)}
+                </span>
+              )}
               {params && (
                 <span className="inline-flex items-center gap-1.5">
                   <IconCpu size={14} className="text-muted-foreground" />
@@ -269,7 +272,9 @@ export function HubModelCard({
             </div>
           </div>
         </div>
-        {fitKnown && (
+        {/* Fit is a pre-download aid; hide once downloaded (also avoids the
+            wrong "Heavy" fallback when an imported entry has no file size). */}
+        {fitKnown && !downloadedDefault && (
           <div className="shrink-0">
             <Tooltip>
               <TooltipTrigger asChild>

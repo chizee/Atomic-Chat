@@ -67,6 +67,7 @@ import { SessionInfo } from '@janhq/core'
 import { fetch as httpFetch } from '@tauri-apps/plugin-http'
 import { useLocalApiServer } from '@/hooks/useLocalApiServer'
 import { ttftPreBegin } from '@/lib/ttft-timing'
+import { extractModelErrorMessage } from '@/lib/modelErrorMessage'
 
 /**
  * Legacy llama.cpp / dflash timings structure (kept for backward
@@ -595,7 +596,7 @@ export class ModelFactory {
         } catch (error) {
           console.error(`Failed to start ${providerName} model:`, error)
           throw new Error(
-            `Failed to start model: ${error instanceof Error ? error.message : JSON.stringify(error)}`
+            `Failed to start model: ${extractModelErrorMessage(error)}`
           )
         }
       }
@@ -753,6 +754,7 @@ export class ModelFactory {
       case 'openrouter':
       case 'huggingface':
       case 'nvidia':
+      case 'ollama':
         return this.createOpenAICompatibleModel(modelId, provider, override)
 
       case 'xai':
@@ -919,7 +921,7 @@ export class ModelFactory {
       } catch (error) {
         console.error('Failed to start Foundation Models:', error)
         throw new Error(
-          `Failed to start model: ${error instanceof Error ? error.message : JSON.stringify(error)}`
+          `Failed to start model: ${extractModelErrorMessage(error)}`
         )
       }
     }

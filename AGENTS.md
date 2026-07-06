@@ -309,6 +309,263 @@ Append-only. Newest at top. Each entry follows this shape:
 
 ---
 
+### 2026-07-01 — Fix Hermes Agent config on Windows writing to the wrong file (`%USERPROFILE%\.hermes` vs the installer's real `HERMES_HOME`), plus a stale-registry-env guard
+- **Context:** A Windows user reported that changing the model in Settings →
+  Hermes Agent had no effect — the `hermes` CLI kept using its old model.
+  Root-caused via two focused subagent investigations (codebase patterns +
+  Hermes installer mechanics), confirmed against the upstream
+  `NousResearch/hermes-agent` `install.ps1` and Python source:
+  1. **Wrong file, unconditionally.** `configure_hermes_agent` /
+     `clear_hermes_agent_config`
+     ([`commands.rs`](src-tauri/src/core/system/commands.rs)) always wrote to
+     `%USERPROFILE%\.hermes\config.yaml`. But the official Windows installer
+     (`install.ps1`) sets `HERMES_HOME` to `%LOCALAPPDATA%\hermes` via
+     `[Environment]::SetEnvironmentVariable("HERMES_HOME", ..., "User")` and
+     seeds a template `config.yaml` there — even with `-SkipSetup
+     -NonInteractive` (those flags only skip the interactive API-key/model
+     wizard, not the `HERMES_HOME` env-var setup or directory scaffolding).
+     Hermes' own `hermes_constants.py::get_hermes_home()` resolves
+     `os.environ["HERMES_HOME"]` first, then falls back to
+     `%LOCALAPPDATA%\hermes` — **never** `%USERPROFILE%\.hermes`, which isn't
+     a Hermes default on any platform. So our app was patching a file the
+     `hermes` CLI never reads.
+  2. **Stale env var, same-session.** Even a naive `std::env::var("HERMES_HOME")`
+     read would be unreliable: the Launch page's Run flow calls
+     `install_agent` (spawns `install.ps1`, which writes `HERMES_HOME` to
+     `HKCU\Environment`) and `configure_hermes_agent` back-to-back in the
+     *same* already-running Tauri process, whose environment block is a
+     snapshot taken at its own startup — registry writes from a child
+     installer never propagate back into it. (Hermes' own official Electron
+     desktop app hit and fixed this exact gap by reading the registry
+     directly — precedent confirmed in
+     `apps/desktop/electron/windows-user-env.cjs`.)
+- **Decision:** New `resolve_hermes_dir()` helper
+  ([`commands.rs`](src-tauri/src/core/system/commands.rs)), used by both
+  `configure_hermes_agent` and `clear_hermes_agent_config`, replacing the
+  hardcoded `USERPROFILE\.hermes` / `HOME/.hermes` split. On Windows it tries,
+  in order: (1) a **fresh** registry read of `HERMES_HOME` via new
+  `#[cfg(windows)] read_windows_user_env(name)` (spawns
+  `powershell -NoProfile -Command "[Environment]::GetEnvironmentVariable('HERMES_HOME', 'User')"`,
+  `CREATE_NO_WINDOW`, mirroring the existing `refresh_windows_path::read_scope`
+  PATH-refresh pattern rather than adding a new `winreg`-based path — the
+  crate is already a dependency but this keeps the read symmetric with the
+  proven PATH mechanism); (2) the process's own (possibly stale but
+  non-worse) `HERMES_HOME` env var, in case a previous launch already picked
+  it up; (3) `%LOCALAPPDATA%\hermes` — Hermes' genuine platform default. Off
+  Windows, behavior is unchanged (`$HOME/.hermes`).
+- **Consequences:** Model/base-URL/provider changes made in Settings → Hermes
+  Agent (and the Launch-page one-click Run flow) now land in the file the
+  `hermes` CLI actually reads, on both a fresh install (installer just ran,
+  same session) and a pre-existing install. No IPC, schema, or on-disk-layout
+  change beyond which directory is targeted; macOS/Linux (`$HOME/.hermes`)
+  are untouched. **Deliberately not done:** no generic reusable
+  "read any Windows user env var" abstraction beyond this one function (the
+  existing `refresh_windows_path` remains PATH-specific and unchanged); no
+  `winreg`-crate-based read was introduced (the PowerShell approach mirrors
+  the already-proven pattern one function above it). **Verified:**
+  `cargo check -p Atomic-Chat` clean (0 errors, only the pre-existing
+  unrelated `FileMetadata` dead_code warning in `tauri-plugin-vector-db`);
+  `ReadLints` clean on the edited file. A live Windows smoke test (install
+  Hermes fresh -> change model in Settings -> confirm `hermes` picks it up)
+  is the residual manual step (no such host in the sandbox).
+- **Owner:** team.
+- **Links:** the 2026-06-01 ADR *Add a "Launch" page ...* (the
+  `configure_hermes_agent` / `install_agent` sequencing this fix corrects
+  for), the 2026-06-29/2026-06-25 ADRs on Windows PATH refresh (the
+  `read_scope` / `refresh_windows_path` pattern reused here), files:
+  [`src-tauri/src/core/system/commands.rs`](src-tauri/src/core/system/commands.rs)
+  (`resolve_hermes_dir`, `read_windows_user_env`, `configure_hermes_agent`,
+  `clear_hermes_agent_config`),
+  [`web-app/src/routes/settings/hermes-agent.tsx`](web-app/src/routes/settings/hermes-agent.tsx).
+
+### 2026-07-01 — Fix `llamacpp-upstream` hot-swap race: persist `version_backend` *before* unloading, not after (Windows "optimal backend selected but still running on CPU" bug)
+- **Context:** Windows user report — after "Find optimal backend" downloads
+  and applies a GPU backend onto a host that was already running a loaded
+  model on the bundled CPU build, the Settings UI immediately shows the new
+  backend as active, but the running `llama-server.exe` process silently
+  stays on the **old** CPU build (no crash, no error — just wrong binary,
+  confirmed by throughput staying CPU-bound). Root cause is a hot-swap
+  ordering race in `applyBackendLive()`
+  ([`extensions/llamacpp-upstream-extension/src/index.ts`](extensions/llamacpp-upstream-extension/src/index.ts)),
+  the private helper `downloadRecommendedBackend()` calls after a successful
+  download to apply the new backend without a full app restart. The old
+  order was: (1) `getLoadedModels()` → (2) `unload()` every loaded model →
+  (3) `updateBackend()` (persists settings + commits
+  `this.config.version_backend` to the new string). Step (2)'s `unload()`
+  flips the model's server status to stopped, which the web-app's
+  local-model auto-start effect
+  ([`ChatInput.tsx`](web-app/src/containers/ChatInput.tsx), the
+  `ensureLocalModelRunning` effect) reacts to *immediately* by calling
+  `switchToModel()` → `performLoad()`. `performLoad()` reads
+  `cfg.version_backend` off a synchronous snapshot of `this.config` taken at
+  call time — so if that auto-reload fires before step (3) commits (a race
+  window Windows widens with the deliberate ~1s delay inside
+  `updateBackend()`), the auto-reload spawns a fresh `llama-server.exe`
+  against the **still-old** `version_backend`, then `updateBackend()`
+  finishes a moment later and flips the UI/config to the new value — leaving
+  the UI and the actually-running process permanently out of sync until the
+  next manual restart. Confirmed the Rust-side process-termination path
+  (`unload_llama_model` / `force_terminate_process` / `find_session_by_model_id`
+  in `tauri-plugin-llamacpp-upstream`) is not at fault — termination is
+  reliable; this is purely a TS-side config-commit-vs-reload ordering bug.
+- **Decision (scope: `llamacpp-upstream-extension` only — the user
+  explicitly declined mirroring it into the turboquant `llamacpp-extension`,
+  which carries the byte-identical pattern but is macOS-only and not the
+  reported bug):** Reorder `applyBackendLive()` so `updateBackend()` commits
+  the new `version_backend` into `this.config` **before** any loaded model is
+  unloaded: (1) `getLoadedModels()` (best-effort, unchanged) → (2)
+  `updateBackend(backendString)`, now throwing early (and touching **no**
+  loaded model) if `wasUpdated` is false → (3) unload each previously-loaded
+  model (best-effort, log-and-continue, unchanged). Any auto-reload the
+  unload step triggers now reads the already-committed new backend. A
+  `updateBackend()` failure is also now strictly safer than before — a
+  working session is never killed on a failed hot-swap attempt, whereas the
+  old order unloaded first and could fail on the update, stranding the user
+  model-less until `activatePendingBackend()` retried on next launch.
+- **Consequences:** Windows (and any other platform driving
+  `llamacpp-upstream`) users who hot-swap onto a better backend while a
+  model is loaded now actually run on the new backend the moment the UI
+  reports it, closing the "optimal backend selected but silently still on
+  CPU" gap. **Deliberately NOT mirrored into `extensions/llamacpp-extension/`
+  (the TurboQuant provider, macOS-only)** — it has the identical
+  unload-then-update ordering in its own `applyBackendLive()` and is
+  logically exposed to the same race, but is out of scope for this fix per
+  explicit user decision; a future ADR should port this reorder there if the
+  same symptom is ever reported on macOS TurboQuant. No IPC, Rust,
+  settings-schema, or on-disk-layout change — pure reorder inside one
+  extension method. **Verified:** rolldown build clean
+  (`dist/index.js` 240.63 kB, exit 0 — the authoritative compile);
+  `ReadLints` clean on the edited file.
+- **Owner:** team.
+- **Links:** §4.2 *LLM backend*, the 2026-06-15/16 ADRs on
+  `llamacpp-upstream` backend fallback/recovery (the broader hot-swap /
+  fallback machinery this method belongs to), files:
+  [`extensions/llamacpp-upstream-extension/src/index.ts`](extensions/llamacpp-upstream-extension/src/index.ts)
+  (`applyBackendLive`, `downloadRecommendedBackend`, `updateBackend`),
+  [`web-app/src/containers/ChatInput.tsx`](web-app/src/containers/ChatInput.tsx)
+  (the local-model auto-start effect that triggered the race).
+
+---
+
+### 2026-06-29 — Auto-install Node.js/npm via `winget` when an npm-based Launch-page agent is installed on a Windows host without npm (graceful fallback to the nodejs.org error)
+- **Context:** `install_agent`
+ ([`commands.rs`](src-tauri/src/core/system/commands.rs)) gates every
+ Launch-page agent install on its prerequisite binary
+ (`agent_install_spec` → `prereq`: `npm` for Claude Code / Codex / OpenCode /
+ OpenClaw / Cline / MiMo / Pi / Kilo, `curl` for Goose/Hermes, etc.). When
+ the prereq was missing it returned an actionable-but-manual error
+ ("Install Node.js from https://nodejs.org, then restart Atomic Chat"). So a
+ fresh Windows machine with no Node couldn't one-click-install any npm-based
+ agent — the user had to leave the app, install Node, restart, and retry.
+- **Decision (per the user-chosen options — `winget`, **Windows-only**,
+ **graceful** fallback; no IPC/schema/contract change):** Before giving up on
+ a missing **npm** prereq, attempt to auto-install Node.js LTS (which bundles
+ npm) via the Windows Package Manager. New `#[cfg(windows)]`
+ `try_bootstrap_npm_via_winget(app_handle, event, proxy)` (a `#[cfg(not(windows))]`
+ twin returns `false`): (1) probes `winget` itself via the existing
+ `detect_agent_installed` (App Installer ships on Win10 1809+ mainline but not
+ LTSC/Server/stripped images); (2) spawns
+ `winget install --id OpenJS.NodeJS.LTS -e --silent --accept-package-agreements
+ --accept-source-agreements` with `CREATE_NO_WINDOW`, `apply_runtime_path` (the
+ registry+npm-prefix PATH refresh from the same-day ADR below) and
+ `apply_proxy_env`, streaming stdout/stderr to the **same**
+ `agent_install_log:<id>` event the agent installer uses so the UI shows
+ progress; (3) re-checks `npm` via `detect_agent_installed` (which re-reads the
+ registry PATH at runtime, so the freshly-installed npm resolves without an app
+ restart). The `install_agent` prereq block now defines `event` up front, and
+ when the prereq is missing it tries the bootstrap **only when `prereq == "npm"`**
+ and only on a successful re-detect continues; otherwise it returns the
+ unchanged actionable nodejs.org error. `ProxyEnv` already derives `Clone`, so
+ the proxy is passed to both the bootstrap and the later install closure.
+- **Consequences:** On Windows, installing an npm-based agent on a Node-less
+ machine now silently bootstraps Node.js LTS via winget (one UAC prompt from
+ winget itself) and proceeds — the Launch flow works end-to-end from the
+ packaged app. When winget is absent, the install fails, or npm still isn't
+ found, it degrades to the existing manual-install error (no behaviour change
+ for that path). **Deliberately NOT done (out of scope):** the MSI-from-nodejs.org
+ and bundled-portable-Node-sidecar alternatives (heavier: own download/verify +
+ UAC, or +~50-90 MB installer + a new build-pipeline branch); auto-installing
+ the `curl`/`powershell` prereqs (non-npm agents are unaffected); any
+ macOS/Linux auto-install (their npm-missing path keeps the manual error per the
+ chosen Windows-only scope). **Verified:** `cargo check -p Atomic-Chat` clean
+ (exit 0; only pre-existing unrelated `dead_code` / `unused_mut` /
+ `non_snake_case` warnings in the mlx / llamacpp / hardware / vector-db plugins).
+ A live Windows smoke test (Node-less host → install an npm agent → winget
+ bootstraps Node → agent installs) is the residual manual step (no such host in
+ the sandbox).
+- **Owner:** team.
+- **Links:** the same-day ADR *Refresh PATH (+ npm global prefix) for the
+ Launch-page interactive agent terminal …* (the `apply_runtime_path` /
+ `refresh_windows_path` machinery this reuses), the 2026-06-25 ADR *Propagate
+ the app proxy into Launch-page agent installers …*, the 2026-06-01 ADR *Add a
+ "Launch" page …*, files:
+ [`src-tauri/src/core/system/commands.rs`](src-tauri/src/core/system/commands.rs)
+ (`try_bootstrap_npm_via_winget`, `install_agent` prereq block).
+
+---
+
+### 2026-06-29 — Refresh PATH (+ npm global prefix) for the Launch-page interactive agent terminal so npm-installed agent shims resolve on Windows from the packaged app
+- **Context:** On Windows, pressing **Run** on a Launch-page coding agent
+ (Claude Code, Codex, OpenCode, …) opened a `cmd` console that reported
+ `'claude' is not recognized as an internal or external command`, even though
+ the agent's npm-global shim (`claude.cmd`) was installed in `%APPDATA%\npm`.
+ Developers running `yarn dev` from a terminal never saw it (their shell PATH
+ is already complete), but a packaged `.exe` launched from Explorer snapshots
+ PATH once at startup via `fix_path_env::fix()` — so Node/npm installed (or
+ `%APPDATA%\npm` broadcast to the user PATH) after first launch stayed
+ invisible to spawned subprocesses. Root cause was an **asymmetry** in
+ [`open_agent_terminal`](src-tauri/src/core/system/commands.rs): the
+ `detect_agent_installed` (`detect_on_native_path`) and `install_agent` paths
+ already call `apply_login_path` + `apply_runtime_path` (the 2026-06-25 ADR's
+ `refresh_windows_path` registry refresh), but the Windows branch of
+ `open_agent_terminal` spawned `cmd /C start "" cmd /K <agent>` with **no**
+ PATH refresh — the launched console inherited only the stale startup
+ snapshot. Compounding it, even a refreshed registry PATH can legitimately
+ lack `%APPDATA%\npm` if the user PATH entry hadn't been broadcast yet, and
+ that dir is exactly where `install_agent`'s own `npm i -g` lands.
+- **Decision (two minimal, complementary fixes; no IPC/schema/contract change):**
+ 1. **Single source of truth — `refresh_windows_path()` now always includes
+ the npm global prefix.** It computes `%APPDATA%\npm` (the default npm global
+ bin dir on Windows, where global shims live) and folds it into the merged,
+ de-duplicated machine→user→npm→live PATH. The early `None` guard is relaxed
+ to also consider the npm dir, so the function can still contribute it even
+ if both registry-scope reads fail. Because all three spawn sites (detect /
+ install / terminal) flow through `apply_runtime_path` →
+ `refresh_windows_path`, every one of them now resolves npm-installed agents
+ regardless of whether the registry PATH carries `%APPDATA%\npm`. Cheap (an
+ env-var join, no `npm prefix -g` process spawn — keeps the per-agent detect
+ probe fast); a non-existent dir is a harmless PATH entry.
+ 2. **`open_agent_terminal` applies the refreshed PATH.** The Windows branch
+ calls `apply_runtime_path(&mut cmd)` on the outer `cmd` before spawn (the
+ launched console inherits this env, exactly like the existing proxy-env
+ propagation). For symmetry, the Linux branch now also calls
+ `apply_login_path` + `apply_runtime_path` (the macOS branch returns early
+ and is unaffected; `bash -lc` there already resolves PATH, so it's belt-and-
+ suspenders, mirroring detect/install).
+- **Consequences:** A freshly-installed (or registry-only) npm agent shim now
+ resolves in the Run terminal without an app restart, so the Launch flow works
+ for Windows users from the packaged app. **Deliberately NOT done (out of
+ scope):** querying the actual `npm prefix -g` for a *custom* npm prefix (rare;
+ the `%APPDATA%\npm` default — also where our own `install_agent` writes —
+ covers the overwhelming majority, and spawning npm on every detect probe
+ would add latency); no change to the proxy-propagation or iGPU-gate logic of
+ the 2026-06-25 ADR. **Verified:** `cargo check -p Atomic-Chat` clean (exit 0;
+ only pre-existing unrelated `dead_code` / `unused_mut` / `non_snake_case`
+ warnings in the mlx / llamacpp / hardware / vector-db plugins). A live
+ Windows packaged-build smoke test (install Node after first launch → Run →
+ agent resolves) is the residual manual step (no such host in the sandbox).
+- **Owner:** team.
+- **Links:** the 2026-06-25 ADR *Propagate the app proxy into Launch-page agent
+ installers, refresh the Windows PATH at install/detect time …* (the
+ `refresh_windows_path` / `apply_runtime_path` machinery this extends), the
+ 2026-06-04 ADR *Resolve the login-shell PATH for Launch-page agent
+ detection/install*, the 2026-06-01 ADR *Add a "Launch" page …*, files:
+ [`src-tauri/src/core/system/commands.rs`](src-tauri/src/core/system/commands.rs)
+ (`refresh_windows_path` npm-prefix inclusion, `open_agent_terminal` Windows +
+ Linux PATH application).
+
+---
+
 ### 2026-06-26 — Fix Linux/Vulkan GPU backend 404 → infinite spinner when manifest tag is stale or CDN asset is missing (ATO-233)
 - **Context:** On Linux + Vulkan, model loads hung indefinitely on the spinner.
  Root cause: the static `atomic-chat-conf/backends/manifest.json` contained tag
@@ -386,6 +643,8 @@ Append-only. Newest at top. Each entry follows this shape:
  (`map_old_backend_to_new` ubuntu-* handling),
  [`src-tauri/src/core/downloads/helpers.rs`](src-tauri/src/core/downloads/helpers.rs)
  (`_get_client_for_item` connect_timeout, `_get_file_size` per-request timeout).
+
+---
 
 ### 2026-06-25 — Propagate the app proxy into Launch-page agent installers, refresh the Windows PATH at install/detect time, and stop "Find optimal backend" picking Vulkan on integrated-only iGPUs
 - **Context:** Three Windows-confirmed defects from a user log + screenshots.

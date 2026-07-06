@@ -38,6 +38,7 @@ import {
   cleanupIncompleteBackends,
   fetchRemoteBackends,
   friendlyBackendLabel,
+  getBackendArchiveName,
   getBackendDownloadUrl,
   getCudartDownloadUrl,
   getCudartArchiveName,
@@ -63,6 +64,10 @@ import {
   gemmaMtpDraftUrl,
   type GemmaMtpDraft,
 } from './gemmaMtpRegistry'
+import {
+  resolveLlama3TemplateOverride,
+  STRICT_SYSTEM_GUARD_SIGNATURE,
+} from './chatTemplateOverrides'
 import { basename } from '@tauri-apps/api/path'
 import { getSystemUsage, getSystemInfo } from './hardware'
 import {
@@ -147,6 +152,12 @@ const ERR_MODEL_FILE_CORRUPT = 'MODEL_FILE_CORRUPT'
 const MULTIMODAL_DISABLED_FALLBACK =
   'local_backend://multimodal_disabled_fallback'
 
+/// Tauri event emitted by the Rust watcher task when a llama-server child
+/// process (PID tracked in LlamacppState::process_map) that was running a
+/// loaded model exits unexpectedly during generation (ATO-244).
+/// Payload: `{ model_id: string, pid: number, error_code: string, message: string }`.
+const SESSION_DIED_EVENT = 'local_backend://llamacpp_upstream_session_died'
+
 /// MODEL_LOAD_TIMED_OUT (ATO-188): large models on slow / cold storage can take
 /// longer than the configured connection timeout (default 600s) to finish
 /// loading and report "ready", so the load was cut off at 600s with a raw
@@ -163,6 +174,16 @@ function modelLoadReadyTimeoutSecs(configuredTimeoutSecs: number): number {
   const base = Number.isFinite(configured) && configured > 0 ? configured : 600
   return Math.max(base, MODEL_LOAD_READY_TIMEOUT_FLOOR_SECS)
 }
+
+/// Temporary hard pin: every launch forcibly reconciles `version_backend`
+/// to this exact ggml-org tag, preserving the user's backend *type*
+/// (cpu/cuda/vulkan/macos-arm64) but never their *version* — this WILL
+/// downgrade a newer manually-installed backend just as readily as it
+/// upgrades an older one. Mirrors the CI/build pins in `Makefile`
+/// (`LLAMACPP_UPSTREAM_TAG`) and `atomic-chat-conf/backends/manifest.json`
+/// (`tag_name`). Remove (or move to a real settings-driven pin) once the
+/// team is done validating this tag broadly. See `enforcePinnedBackendVersion`.
+const PINNED_BACKEND_TAG = 'b9881'
 
 /**
  * Override the default app.log function to use Jan's logging system.
@@ -386,6 +407,7 @@ export default class llamacpp_upstream_extension extends AIEngine {
   private modelMaxCtxTrain = new Map<string, number>()
   private unlistenValidationStarted?: () => void
   private unlistenAutoIncreaseCtx?: () => void
+  private unlistenSessionDied?: () => void
 
   override async onLoad(): Promise<void> {
     super.onLoad() // Calls registerEngine() from AIEngine
@@ -541,12 +563,33 @@ export default class llamacpp_upstream_extension extends AIEngine {
       }
     )
 
+    // ATO-244: Rust post-load watcher task emits this event when a
+    // llama-server child that was running (model already loaded) exits
+    // unexpectedly during generation (e.g. Vulkan GPU crash / SIGSEGV).
+    // Clean up internal session state so the extension stays consistent.
+    // `DataProvider.tsx` listens to this same Rust-emitted event directly to
+    // show the crash toast — see the doc comment on `handleSessionDied` for
+    // why this handler must NOT re-emit it.
+    this.unlistenSessionDied = await listen<{
+      model_id: string
+      pid: number
+      error_code: string
+      message: string
+    }>(SESSION_DIED_EVENT, (event) => {
+      void this.handleSessionDied(event.payload)
+    })
+
     //* configureBackends может долго качать движок — не await, иначе весь UI ждёт завершения.
     this.configureBackendsPromise = this.configureBackends()
       .catch((err) => {
         //! Раньше отклонённый промис терялся; без лога сложно понять вечный «loading» в настройках.
         logger.error('configureBackends failed:', err)
       })
+      // Runs after every launch resolves a concrete `version_backend`, to
+      // forcibly reconcile it to `PINNED_BACKEND_TAG`. Chained onto the
+      // same promise so callers awaiting `configureBackendsPromise` also
+      // observe the pin before touching the backend.
+      .then(() => this.enforcePinnedBackendVersion())
       .finally(() => {
         this.isInitializing = false
         this.configureBackendsPromise = null
@@ -1313,6 +1356,52 @@ export default class llamacpp_upstream_extension extends AIEngine {
     }
   }
 
+  /**
+   * Forcibly reconciles the active backend to `PINNED_BACKEND_TAG`,
+   * preserving the user's current backend *type* (cpu/cuda/vulkan/
+   * macos-arm64) — never their version. Runs once per launch, after
+   * `configureBackends()` has resolved a concrete `version_backend`.
+   *
+   * This is a hard pin: it downgrades a newer manually-installed backend
+   * just as readily as it upgrades an older one. If the pinned tag has no
+   * asset for the user's current type (e.g. a type removed upstream), the
+   * download/hot-swap fails and is logged, leaving the working backend
+   * untouched rather than bricking the install.
+   */
+  private async enforcePinnedBackendVersion(): Promise<void> {
+    try {
+      const current = stripBom(this.config.version_backend || '')
+      if (!isConcreteVersionBackend(current)) {
+        logger.info(
+          'enforcePinnedBackendVersion: no concrete backend configured yet, skipping'
+        )
+        return
+      }
+
+      const slashIdx = current.indexOf('/')
+      const currentTag = current.slice(0, slashIdx)
+      const currentType = current.slice(slashIdx + 1)
+
+      if (currentTag === PINNED_BACKEND_TAG) {
+        return
+      }
+
+      const target = `${PINNED_BACKEND_TAG}/${currentType}`
+      logger.info(
+        `enforcePinnedBackendVersion: pinning backend '${current}' -> '${target}'`
+      )
+      await this.downloadRecommendedBackend(target)
+      logger.info(
+        `enforcePinnedBackendVersion: backend pinned to '${target}'`
+      )
+    } catch (err) {
+      logger.error(
+        'enforcePinnedBackendVersion: failed to pin backend version (keeping current backend):',
+        err
+      )
+    }
+  }
+
   private async determineBestBackend(
     version_backends: { version: string; backend: string }[]
   ): Promise<string> {
@@ -1875,16 +1964,29 @@ export default class llamacpp_upstream_extension extends AIEngine {
   }
 
   /**
-   * Apply a freshly-downloaded backend to the running process: stop any
-   * loaded llama.cpp models, swap `version_backend` via `updateBackend()`,
-   * clear the pending marker, and notify the UI via a window event.
+   * Apply a freshly-downloaded backend to the running process: swap
+   * `version_backend` via `updateBackend()` first, then stop any loaded
+   * llama.cpp models, clear the pending marker, and notify the UI via a
+   * window event.
+   *
+   * Order matters: `updateBackend()` must commit the new `version_backend`
+   * into `this.config` *before* any model is unloaded. Unloading flips the
+   * model's status to stopped, which the web-app's local-model auto-start
+   * effect (`ChatInput.tsx`) reacts to by immediately reloading it via
+   * `switchToModel()`. `performLoad()` snapshots `this.config` synchronously
+   * at call time, so an unload-before-update ordering let that auto-reload
+   * race ahead of `updateBackend()` and respawn `llama-server` against the
+   * *old* backend — the UI would then report the switch as complete while
+   * the running process silently stayed on the previous (e.g. CPU) build.
    *
    * Failure modes:
+   *   - `updateBackend()` throws → we propagate without touching any loaded
+   *     model, so a failed hot-swap never kills a working session. Caller
+   *     leaves the pending marker in place so `activatePendingBackend()`
+   *     retries on next launch.
    *   - `unload()` throws when a session can't be cleanly stopped → we log
-   *     and continue, because `updateBackend()` only mutates settings and
-   *     does not require an empty session table.
-   *   - `updateBackend()` throws → we propagate. Caller leaves the pending
-   *     marker in place so `activatePendingBackend()` retries on next launch.
+   *     and continue; the new backend is already persisted, so the next
+   *     load (auto or manual) picks it up regardless.
    */
   private async applyBackendLive(backendString: string): Promise<void> {
     let loaded: string[] = []
@@ -1892,6 +1994,13 @@ export default class llamacpp_upstream_extension extends AIEngine {
       loaded = await this.getLoadedModels()
     } catch (err) {
       logger.warn('applyBackendLive: getLoadedModels failed (continuing):', err)
+    }
+
+    const result = await this.updateBackend(backendString)
+    if (!result.wasUpdated) {
+      throw new Error(
+        `updateBackend reported wasUpdated=false for ${backendString}`
+      )
     }
 
     for (const modelId of loaded) {
@@ -1903,13 +2012,6 @@ export default class llamacpp_upstream_extension extends AIEngine {
           err
         )
       }
-    }
-
-    const result = await this.updateBackend(backendString)
-    if (!result.wasUpdated) {
-      throw new Error(
-        `updateBackend reported wasUpdated=false for ${backendString}`
-      )
     }
 
     localStorage.removeItem('llama_cpp_pending_backend')
@@ -2203,6 +2305,9 @@ export default class llamacpp_upstream_extension extends AIEngine {
     }
     if (this.unlistenAutoIncreaseCtx) {
       this.unlistenAutoIncreaseCtx()
+    }
+    if (this.unlistenSessionDied) {
+      this.unlistenSessionDied()
     }
   }
 
@@ -3692,6 +3797,37 @@ export default class llamacpp_upstream_extension extends AIEngine {
     // llama-server only for it to crash with an opaque truncated-path error.
     await this.validateModelArtifacts(modelConfig, modelPath, mmprojPath)
 
+    // Llama 3.x `--jinja` auto-parser fix: the unsloth conversions embed a
+    // strict `raise_exception('System message must be at the beginning')`
+    // guard that the auto-parser's synthetic probes trip, failing parser
+    // generation with `400 Unable to generate parser`. Substitute the
+    // canonical Meta Llama 3.x template (no such guard) only when the user
+    // hasn't set an explicit chat_template.
+    if (!cfg.chat_template?.trim()) {
+      try {
+        const embedded = (await readGgufMetadata(modelPath))?.metadata?.[
+          'tokenizer.chat_template'
+        ] as string | undefined
+        const override = resolveLlama3TemplateOverride(modelId, embedded)
+        if (override) {
+          cfg.chat_template = override
+          logger.warn(
+            `[performLoad] Overriding strict embedded chat_template for "${modelId}" with the canonical Meta Llama 3.x template (auto-parser-safe).`
+          )
+        } else if (embedded?.includes(STRICT_SYSTEM_GUARD_SIGNATURE)) {
+          logger.warn(
+            `[performLoad] Model "${modelId}" has a strict system-message guard in its embedded chat_template but is not a recognized Llama 3.x format; leaving the template untouched.`
+          )
+        }
+      } catch (e) {
+        logger.warn(
+          `[performLoad] chat_template override probe failed for "${modelId}": ${
+            e instanceof Error ? e.message : String(e)
+          }`
+        )
+      }
+    }
+
     // Gemma 4 MTP: the draft head is a separate GGUF keyed to the loaded
     // target, so resolve it lazily here rather than only at toggle time. If
     // MTP is enabled, this model is a Gemma 4 31B / 26B-A4B target, and the
@@ -3995,6 +4131,64 @@ export default class llamacpp_upstream_extension extends AIEngine {
 
   /// Bridge from the Local API Server proxy (Rust) back to the extension
   /// when a forwarded request exhausts the model's context window. We
+  /// Handle an unexpected llama-server process exit that happened AFTER the
+  /// model had finished loading (i.e. during active generation). The Rust
+  /// post-load watcher task emits `SESSION_DIED_EVENT` and has already
+  /// removed the session entry from the Rust `process_map`.
+  ///
+  /// Responsibilities here:
+  ///  1. Clean up extension-level state (sessionCache, modelCtxSize) so
+  ///     the extension does not believe the model is still loaded.
+  ///  2. Attempt `this.unload()` for any remaining state cleanup (it will
+  ///     succeed even if the process is already gone — Rust returns "not
+  ///     found → success" in that case).
+  ///
+  /// Does NOT re-emit `SESSION_DIED_EVENT` on the Tauri bus: the Rust watcher
+  /// already emitted it once via `app_handle.emit(...)`, which is a
+  /// webview-wide broadcast that this extension's own `listen(SESSION_DIED_EVENT,
+  /// ...)` subscription (see onLoad) also receives directly — no relay needed.
+  /// A prior version of this method re-emitted the event "just in case",
+  /// which — because the extension listens to that very channel — caused the
+  /// re-emit to retrigger this same handler, which re-emitted again,
+  /// indefinitely. That infinite loop of no-op unload + emit calls pegged the
+  /// event loop (observed as the whole app hanging) and kept resurfacing the
+  /// crash toast / racing with a subsequent legitimate reload attempt (seen
+  /// as a spurious "Server is already running" toast on top of a model that
+  /// had actually reloaded fine). `DataProvider.tsx` listens to the raw Rust
+  /// event directly and needs nothing further from this method.
+  private async handleSessionDied(payload: {
+    model_id: string
+    pid: number
+    error_code: string
+    message: string
+  }): Promise<void> {
+    const { model_id, error_code, message } = payload
+    logger.warn(
+      `[sessionDied] llamacpp-upstream: model='${model_id}' crashed during generation ` +
+        `(code=${error_code}): ${message}`
+    )
+
+    // Best-effort unload first — it will look up the session in sessionCache,
+    // call Rust's unload (a no-op there since the watcher already removed the
+    // entry from process_map, which returns success), and then clean up
+    // sessionCache itself.
+    try {
+      await this.unload(model_id)
+    } catch (e) {
+      // Expected when the watcher already removed the entry from both the Rust
+      // process_map and sessionCache has no entry. Manually clean up.
+      this.sessionCache.delete(model_id)
+      logger.warn(`[sessionDied] unload for '${model_id}' was a no-op (already cleaned): ${e}`)
+    }
+
+    // modelCtxSize is not touched by unload(); clear it here.
+    this.modelCtxSize.delete(model_id)
+    // Keep modelMaxCtxTrain — it's read from the GGUF header and doesn't change.
+
+    // Intentionally no re-emit of SESSION_DIED_EVENT here — see the doc
+    // comment above this method for why that used to cause an infinite loop.
+  }
+
   /// unload + reload the model with a larger ctx_size, inform the proxy via
   /// a request-scoped done event, and notify the web-app UI so the Zustand
   /// provider store mirrors the new value (so the next UI interaction keeps
@@ -4496,7 +4690,7 @@ export default class llamacpp_upstream_extension extends AIEngine {
     if (!(await fs.existsSync(tempDir))) {
       await fs.mkdir(tempDir)
     }
-    const archiveName = `llama-${version}-bin-${backend}.zip`
+    const archiveName = getBackendArchiveName(version, backend)
     const archivePath = await joinPath([tempDir, archiveName])
     const targetDir = await getBackendDir(backend, version)
 
@@ -4596,6 +4790,10 @@ export default class llamacpp_upstream_extension extends AIEngine {
       })
 
       const exeName = IS_WINDOWS ? 'llama-server.exe' : 'llama-server'
+      await invoke('normalize_backend_layout', {
+        outputDir: targetDir,
+        exeName,
+      })
       const expectedBin = await joinPath([targetDir, 'build', 'bin', exeName])
 
       if (!(await fs.existsSync(expectedBin))) {
@@ -4632,6 +4830,45 @@ export default class llamacpp_upstream_extension extends AIEngine {
             const src = await joinPath([targetDir, baseName])
             const dst = await joinPath([buildBinDir, baseName])
             await fs.mv(src, dst)
+          }
+        } else {
+          // Linux ggml-org tarballs can extract into a nested top-level
+          // directory such as `llama-b9691/` with `llama-server` and shared
+          // libraries inside it. Normalize that layout to the same
+          // `<backend>/build/bin/` shape used by bundled backends.
+          const entries = (await fs.readdirSync(targetDir)) as string[]
+          const nestedDirEntry = entries.find((rawEntry) => {
+            const baseName = rawEntry.split(/[/\\]/).filter(Boolean).pop()
+            return baseName?.startsWith('llama-')
+          })
+          if (nestedDirEntry) {
+            const nestedBaseName = nestedDirEntry
+              .split(/[/\\]/)
+              .filter(Boolean)
+              .pop()
+            if (nestedBaseName) {
+              const nestedDir = await joinPath([targetDir, nestedBaseName])
+              const nestedBin = await joinPath([nestedDir, exeName])
+              if (await fs.existsSync(nestedBin)) {
+                logger.info(
+                  `Relocating nested backend layout ${nestedBaseName}/ into build/bin/`
+                )
+                const buildBinDir = await joinPath([targetDir, 'build', 'bin'])
+                await fs.mkdir(buildBinDir)
+                const nestedEntries = (await fs.readdirSync(nestedDir)) as string[]
+                for (const rawNestedEntry of nestedEntries) {
+                  const baseName = rawNestedEntry
+                    .split(/[/\\]/)
+                    .filter(Boolean)
+                    .pop()
+                  if (!baseName) continue
+                  const src = await joinPath([nestedDir, baseName])
+                  const dst = await joinPath([buildBinDir, baseName])
+                  await fs.mv(src, dst)
+                }
+                await fs.rm(nestedDir)
+              }
+            }
           }
         }
       }

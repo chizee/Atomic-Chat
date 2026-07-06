@@ -41,7 +41,9 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import {
+  isKeylessRemoteProvider,
   isLocalProvider,
+  isLoopbackUrl,
   unregisterRemoteProvider,
 } from '@/utils/registerRemoteProvider'
 import { syncActiveModelsFromEngines } from '@/utils/activeModelsSync'
@@ -524,6 +526,77 @@ function ProviderDetail() {
   // Note: settingsChanged event is now handled globally in GlobalEventHandler
   // This ensures all screens receive the event intermediately
 
+  // Auto-load models for loopback providers (Ollama, LM Studio, custom
+  // self-hosted OpenAI-compatible servers, …). Their catalog is dynamic —
+  // whatever the user runs locally — so we silently probe /v1/models instead
+  // of forcing a manual Refresh. This fires both on entry (built-in Ollama,
+  // whose loopback base_url comes from the registry) AND when the user edits a
+  // custom provider's Base URL to a loopback address. Errors are non-fatal and
+  // the manual Refresh button remains available.
+  const loopbackBaseUrl =
+    provider &&
+    !isLocalProvider(provider.provider) &&
+    provider.base_url &&
+    isLoopbackUrl(provider.base_url)
+      ? provider.base_url
+      : null
+
+  useEffect(() => {
+    if (!loopbackBaseUrl) return
+
+    let cancelled = false
+
+    // Debounce: editing the Base URL field char-by-char must not spam the
+    // endpoint. We fetch only after typing settles (and re-fetch cleanly if
+    // the URL changes again, since the timer is cleared on cleanup).
+    const timer = setTimeout(() => {
+      const prov = useModelProvider.getState().getProviderByName(providerName)
+      if (cancelled || !prov) return
+
+      const load = async () => {
+        setRefreshingModels(true)
+        try {
+          const liveIds = await serviceHub
+            .providers()
+            .fetchModelsFromProvider(prov)
+          if (cancelled) return
+
+          const existing = new Set(prov.models.map((m) => m.id))
+          const newModels = liveIds
+            .filter((id) => !existing.has(id))
+            .map((id) => ({
+              id,
+              model: id,
+              name: id,
+              capabilities: getModelCapabilities(prov.provider, id),
+              version: '1.0',
+            }))
+
+          if (newModels.length > 0) {
+            updateProvider(prov.provider, {
+              ...prov,
+              models: [...prov.models, ...newModels],
+            })
+          }
+        } catch (err) {
+          console.warn(
+            `[providers:${providerName}] auto model load failed (non-fatal):`,
+            err
+          )
+        } finally {
+          if (!cancelled) setRefreshingModels(false)
+        }
+      }
+
+      void load()
+    }, 500)
+
+    return () => {
+      cancelled = true
+      clearTimeout(timer)
+    }
+  }, [providerName, loopbackBaseUrl, serviceHub, updateProvider])
+
   const handleRefreshModels = async () => {
     if (!provider) return
 
@@ -574,7 +647,7 @@ function ProviderDetail() {
       // expose hundreds of junk/internal IDs at /v1/models). When the flag is
       // explicitly false we show the curated registry list only and skip the
       // live probe. Missing/true keeps the hybrid behavior.
-      let finalProviders = fresh
+      let liveNewModels: Model[] = []
       let liveFetchError: Error | null = null
       const registrySupportsListing =
         registryProvider?.supports_model_listing !== false
@@ -594,7 +667,7 @@ function ProviderDetail() {
             ...existingIds,
             ...(registryProvider?.models ?? []).map((m) => m.id),
           ])
-          const liveNewModels = liveModelIds
+          liveNewModels = liveModelIds
             .filter((id) => !afterRegistryIds.has(id))
             .map((id) => ({
               id,
@@ -604,16 +677,7 @@ function ProviderDetail() {
               version: '1.0',
             }))
 
-          if (liveNewModels.length > 0) {
-            newCount += liveNewModels.length
-            // Inject the live-only models into the fresh providers snapshot
-            // so setProviders persists them together with the registry ones.
-            finalProviders = fresh.map((p) =>
-              p.provider === provider.provider
-                ? { ...p, models: [...(p.models ?? []), ...liveNewModels] }
-                : p
-            )
-          }
+          if (liveNewModels.length > 0) newCount += liveNewModels.length
 
           console.info(
             `[providers:${provider.provider}] live /models: ${liveModelIds.length} total, ${liveNewModels.length} new`
@@ -631,10 +695,31 @@ function ProviderDetail() {
         }
       }
 
-      // `setProviders` merges new models into useModelProvider while
-      // preserving API keys, base URLs, and user-tweaked settings on a
-      // per-provider basis. Existing models are NEVER removed.
-      setProviders(finalProviders)
+      // Apply the registry refresh. `setProviders` merges catalog updates while
+      // preserving API keys, base URLs, and user-tweaked settings per provider,
+      // and never removes existing models.
+      setProviders(fresh)
+
+      // Persist the live-discovered models onto THIS provider. We cannot inject
+      // into `fresh` because custom / self-hosted providers (AIML, Cerebras,
+      // LM Studio, vLLM, …) are NOT part of getProviders() output — they live
+      // only in useModelProvider state, so the old `fresh.map()` injection
+      // silently dropped them (toast said "Added N" but the list stayed empty).
+      // updateProvider operates on current state and works for both registry
+      // and custom providers.
+      if (liveNewModels.length > 0) {
+        const current =
+          useModelProvider.getState().getProviderByName(provider.provider) ??
+          provider
+        // Dedupe by id (first-seen wins) so both newly fetched duplicates and
+        // any duplicates already persisted from an earlier refresh collapse to
+        // a single row.
+        const byId = new Map<string, Model>()
+        for (const m of [...current.models, ...liveNewModels]) {
+          if (m.id && !byId.has(m.id)) byId.set(m.id, m)
+        }
+        updateProvider(provider.provider, { models: Array.from(byId.values()) })
+      }
 
       if (newCount > 0) {
         toast.success(t('providers:models'), {
@@ -1899,7 +1984,17 @@ function ProviderDetail() {
                                 settingKey === 'base-url' &&
                                 typeof newValue === 'string'
                               ) {
-                                updateObj.base_url = newValue
+                                // Trim so a stray leading/trailing space (common
+                                // on paste) doesn't leak into request URLs as
+                                // `/v1 /models` → 404. Normalise the stored
+                                // setting value too, not just the mirror field.
+                                const trimmedUrl = newValue.trim()
+                                ;(
+                                  newSettings[settingIndex].controller_props as {
+                                    value: string | boolean | number
+                                  }
+                                ).value = trimmedUrl
+                                updateObj.base_url = trimmedUrl
                               }
 
                               // Reset device setting to empty when backend version changes
@@ -2271,7 +2366,7 @@ function ProviderDetail() {
                           title={
                             <div className="flex items-center gap-2">
                               <h1
-                                className="font-medium line-clamp-1"
+                                className="font-medium line-clamp-1 max-w-[16rem] lg:max-w-[24rem] xl:max-w-none"
                                 title={model.id}
                               >
                                 {getModelDisplayName(model)}
@@ -2342,7 +2437,8 @@ function ProviderDetail() {
                                   // proxy). Local engines don't.
                                   const needsApiKey =
                                     !isLocalProvider(provider.provider) &&
-                                    !provider.api_key
+                                    !provider.api_key &&
+                                    !isKeylessRemoteProvider(provider)
                                   const isActive = activeModels.some(
                                     (activeModel) => activeModel === model.id
                                   )

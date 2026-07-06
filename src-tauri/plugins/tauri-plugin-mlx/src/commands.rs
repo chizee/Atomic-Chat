@@ -25,6 +25,45 @@ pub struct UnloadResult {
     error: Option<String>,
 }
 
+/// Diagnose why the mlx-server child exited and log a precise, actionable line.
+///
+/// The mlx-server (PyInstaller onefile) has a slow, silent startup. When it
+/// dies before emitting a readiness signal we need to know whether it crashed
+/// *in-process* (it printed something to stderr) or was terminated by an
+/// *external signal* (empty stderr + a signal exit status such as SIGKILL/9).
+/// The latter points at an outside killer — OS OOM, code-signing/Gatekeeper,
+/// or something in the app tearing the process down — not an mlx-vlm bug.
+fn log_mlx_exit(phase: &str, status: std::process::ExitStatus, stderr_output: &str) {
+    #[cfg(unix)]
+    let signal = {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal()
+    };
+    #[cfg(not(unix))]
+    let signal: Option<i32> = None;
+
+    log::error!("MLX server exited ({phase}) with status {status:?}");
+
+    if let Some(sig) = signal {
+        log::error!(
+            "MLX server was terminated by signal {sig} \
+             (e.g. 9 = SIGKILL, 15 = SIGTERM) — an EXTERNAL process killed it, \
+             it did not crash on its own"
+        );
+    }
+
+    if stderr_output.trim().is_empty() {
+        log::error!(
+            "MLX server produced NO stderr before exiting — this is the \
+             signature of an external kill (SIGKILL/OOM/Gatekeeper), not an \
+             in-process crash. Check `log show --predicate 'sender == \"kernel\"'` \
+             for OOM/codesign, and `codesign -dv` on the mlx-server binary."
+        );
+    } else {
+        log::error!("MLX server stderr:\n{stderr_output}");
+    }
+}
+
 /// MLX server configuration passed from the frontend
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MlxConfig {
@@ -212,6 +251,13 @@ pub async fn load_mlx_model_impl(
     command.env("MLX_VLM_SINGLE_MODEL", "1");
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
+    // Kill the spawned mlx-server if this load future is dropped before the
+    // child is handed off to the tracked session map (e.g. a rapid model switch
+    // supersedes/cancels an in-flight load). Without this, tokio leaves the
+    // process running untracked, so cleanup can never reap it and orphaned
+    // mlx-server instances pile up. Once inserted into the map the child is
+    // owned there (not dropped), so healthy sessions keep running normally.
+    command.kill_on_drop(true);
 
     // Spawn the child process
     let mut child = command.spawn().map_err(ServerError::Io)?;
@@ -317,8 +363,7 @@ pub async fn load_mlx_model_impl(
     if let Some(status) = child.try_wait()? {
         if !status.success() {
             let stderr_output = stderr_task.await.unwrap_or_default();
-            log::error!("MLX server failed early with code {:?}", status);
-            log::error!("{}", stderr_output);
+            log_mlx_exit("early startup", status, &stderr_output);
             return Err(MlxError::from_stderr(&stderr_output).into());
         }
     }
@@ -338,10 +383,11 @@ pub async fn load_mlx_model_impl(
                 if let Some(status) = child.try_wait()? {
                     let stderr_output = stderr_task.await.unwrap_or_default();
                     if !status.success() {
-                        log::error!("MLX server exited with error code {:?}", status);
+                        log_mlx_exit("while waiting for ready", status, &stderr_output);
                         return Err(MlxError::from_stderr(&stderr_output).into());
                     } else {
                         log::error!("MLX server exited successfully but without ready signal");
+                        log::error!("MLX server stderr before clean exit:\n{}", stderr_output);
                         return Err(MlxError::from_stderr(&stderr_output).into());
                     }
                 }

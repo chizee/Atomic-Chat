@@ -149,6 +149,33 @@ impl ArgumentBuilder {
         "q8_0".to_string()
     }
 
+    /// Returns true when the backend id indicates a Vulkan build
+    /// (e.g. `linux-vulkan-x64`, `windows-x64-vulkan`, `ubuntu-vulkan-x64`).
+    fn is_vulkan_backend(&self) -> bool {
+        self.backend.contains("vulkan")
+    }
+
+    /// Apply safety overrides for Vulkan backends before any argument is
+    /// emitted.
+    ///
+    /// Flash attention set to "auto" is known to trigger GPU device-lost
+    /// crashes on the first decode batch on some Vulkan driver/model
+    /// combinations (ATO-244). Downgrade "auto" → "off" so the default
+    /// is stable; users who have explicitly set "on" keep their choice.
+    fn apply_vulkan_safety_overrides(&mut self) {
+        if !self.is_vulkan_backend() {
+            return;
+        }
+        if self.config.flash_attn == "auto" {
+            log::info!(
+                "Vulkan backend ({}): overriding flash_attn auto→off for stability (ATO-244). \
+                 Re-enable in Settings → Provider → Flash Attention if needed.",
+                self.backend
+            );
+            self.config.flash_attn = "off".to_string();
+        }
+    }
+
     /// Build all arguments based on configuration
     pub fn build(
         mut self,
@@ -161,6 +188,8 @@ impl ArgumentBuilder {
         // `add_parallel_settings` / `add_boolean_flags` pick up the overridden
         // values without duplicating flag emission logic.
         self.apply_concurrent_mode_overrides();
+        // Apply Vulkan-specific safety defaults (ATO-244: flash_attn auto→off).
+        self.apply_vulkan_safety_overrides();
 
         // Disable llama-server webui for non-ik backends
         if !self.backend.starts_with("ik") {
@@ -849,6 +878,76 @@ mod tests {
         let args = builder.build("test", "/path", 8080, None);
 
         assert_no_flag(&args, "--flash-attn");
+    }
+
+    // --- Vulkan safety-override tests (ATO-244) ---
+
+    #[test]
+    fn test_vulkan_backend_flash_attn_auto_forced_off() {
+        // flash_attn="auto" on a Vulkan backend must be downgraded to "off"
+        // to prevent GPU device-lost crashes during the first decode batch.
+        let mut config = default_config();
+        config.version_backend = "b9691/linux-vulkan-x64".to_string();
+        config.flash_attn = "auto".to_string();
+
+        let builder = ArgumentBuilder::new(config, false).unwrap();
+        let args = builder.build("test", "/path", 8080, None);
+
+        assert_arg_pair(&args, "--flash-attn", "off");
+    }
+
+    #[test]
+    fn test_vulkan_backend_flash_attn_explicit_on_preserved() {
+        // An explicit user choice of "on" is NOT overridden.
+        let mut config = default_config();
+        config.version_backend = "b9691/linux-vulkan-x64".to_string();
+        config.flash_attn = "on".to_string();
+
+        let builder = ArgumentBuilder::new(config, false).unwrap();
+        let args = builder.build("test", "/path", 8080, None);
+
+        assert_arg_pair(&args, "--flash-attn", "on");
+    }
+
+    #[test]
+    fn test_vulkan_backend_flash_attn_explicit_off_preserved() {
+        let mut config = default_config();
+        config.version_backend = "b9691/linux-vulkan-x64".to_string();
+        config.flash_attn = "off".to_string();
+
+        let builder = ArgumentBuilder::new(config, false).unwrap();
+        let args = builder.build("test", "/path", 8080, None);
+
+        assert_arg_pair(&args, "--flash-attn", "off");
+    }
+
+    #[test]
+    fn test_non_vulkan_backend_flash_attn_auto_unaffected() {
+        // Non-Vulkan backends must NOT get the override.
+        let mut config = default_config();
+        config.version_backend = "b9691/linux-cpu-x64".to_string();
+        config.flash_attn = "auto".to_string();
+
+        let builder = ArgumentBuilder::new(config, false).unwrap();
+        let args = builder.build("test", "/path", 8080, None);
+
+        // auto is sent as-is on non-Vulkan (it's a recognised value for b6325+)
+        assert_arg_pair(&args, "--flash-attn", "auto");
+    }
+
+    #[test]
+    fn test_turboquant_windows_vulkan_backend_flash_attn_auto_forced_off() {
+        // Turboquant-format Windows Vulkan backend: is_turboquant() → true →
+        // supports_string_arg → true → --flash-attn off is emitted.
+        let mut config = default_config();
+        config.version_backend =
+            "turboquant-windows-x64-vulkan-d86eb0b/windows-x64-vulkan".to_string();
+        config.flash_attn = "auto".to_string();
+
+        let builder = ArgumentBuilder::new(config, false).unwrap();
+        let args = builder.build("test", "/path", 8080, None);
+
+        assert_arg_pair(&args, "--flash-attn", "off");
     }
 
     // Mirror of the turboquant-plugin regression test: even though the

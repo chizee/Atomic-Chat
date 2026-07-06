@@ -596,7 +596,10 @@ jobs:
           if [ ! -f "$DIR/build/bin/llama-server.exe" ] && [ -f "$DIR/llama-server.exe" ]; then
             echo "Relocating flat-extracted binaries into build/bin/..."
             mkdir -p "$DIR/build/bin"
-            mv "$DIR"/*.exe "$DIR/build/bin/" 2>/dev/null || true
+            # Move ALL top-level files (exe + DLLs incl. llama-server-impl.dll),
+            # not just *.exe; keep the meta files (version.txt/backend.txt) at
+            # the resource root where install_bundled_backend expects them.
+            find "$DIR" -maxdepth 1 -type f ! -name version.txt ! -name backend.txt -exec mv {} "$DIR/build/bin/" \;
           fi
           echo "TurboQuant CPU backend ($BACKEND) downloaded successfully. App will auto-download GPU backend at runtime."
 

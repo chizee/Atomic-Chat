@@ -89,10 +89,24 @@ impl LlamacppError {
             );
         }
 
-        if lower_stderr.contains("error loading model architecture") {
+        // A model this build can't load because its architecture or metadata
+        // layout is unknown to the engine. Two shapes show up:
+        //   1. "error loading model architecture: unknown model architecture:
+        //      'X'" — the arch enum is missing entirely.
+        //   2. "error loading model hyperparameters: key not found in model:
+        //      qwen3vl.rope.dimension_sections" — the arch is recognised but the
+        //      GGUF uses a newer metadata layout than this build understands
+        //      (e.g. a Qwen3-VL model pulled through a newer Ollama).
+        // Both mean "this engine version can't run this model", so surface an
+        // actionable arch-not-supported error instead of dumping raw stderr.
+        if lower_stderr.contains("error loading model architecture")
+            || lower_stderr.contains("unknown model architecture")
+            || lower_stderr.contains("error loading model hyperparameters")
+            || lower_stderr.contains("key not found in model")
+        {
             return Self::new(
                 ErrorCode::ModelArchNotSupported,
-                "The model's architecture is not supported by this version of the backend.".into(),
+                "The model's architecture or format is not supported by this version of the backend.".into(),
                 Some(stderr.into()),
             );
         }

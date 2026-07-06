@@ -2,6 +2,7 @@ import { createFileRoute } from '@tanstack/react-router'
 import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { type as osType } from '@tauri-apps/plugin-os'
 import { openUrl } from '@tauri-apps/plugin-opener'
 import posthog from 'posthog-js'
 import { toast } from 'sonner'
@@ -225,6 +226,16 @@ function AgentIcon({ agent }: { agent: IntegrationAgent }) {
         <IconBox bg="#ffffff">
           <img
             src="/images/integrations/openhands.svg"
+            alt={agent.name}
+            className="size-full object-contain p-1"
+          />
+        </IconBox>
+      )
+    case 'poolside':
+      return (
+        <IconBox bg="#ffffff">
+          <img
+            src="/images/integrations/poolside.svg"
             alt={agent.name}
             className="size-full object-contain p-1"
           />
@@ -639,6 +650,9 @@ function LaunchPage() {
         case 'kilo':
           await invoke('configure_kilo', { apiUrl, model, apiKey: key })
           break
+        case 'poolside':
+          await invoke('configure_poolside', { apiUrl, model, apiKey: key })
+          break
         case 'openclaw':
           await invoke('configure_openclaw', { apiUrl, model, apiKey: key })
           break
@@ -719,6 +733,20 @@ function LaunchPage() {
             command = 'goose session'
           } else if (agent.id === 'openhands') {
             command = 'openhands --override-with-envs'
+          } else if (agent.id === 'poolside') {
+            const connectHost =
+              serverHost === '0.0.0.0' || (serverHost as string) === '::'
+                ? '127.0.0.1'
+                : serverHost
+            const apiUrl = `http://${connectHost}:${serverPort}${apiPrefix}`
+            const standaloneBase = apiUrl.replace(/\/v1\/?$/, '')
+            const key = apiKey || 'atomic'
+            const modelId = model ?? ''
+            if (osType() === 'windows') {
+              command = `set POOLSIDE_STANDALONE_BASE_URL=${standaloneBase}&& set POOLSIDE_API_KEY=${key}&& set POOLSIDE_STANDALONE_MODEL=${modelId}&& pool`
+            } else {
+              command = `POOLSIDE_STANDALONE_BASE_URL='${standaloneBase}' POOLSIDE_API_KEY='${key}' POOLSIDE_STANDALONE_MODEL='${modelId}' pool`
+            }
           } else {
             command = agent.detectBin
           }
@@ -755,6 +783,10 @@ function LaunchPage() {
       setBusy,
       setSpinning,
       setPhase,
+      serverHost,
+      serverPort,
+      apiPrefix,
+      apiKey,
     ]
   )
 

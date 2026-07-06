@@ -22,9 +22,11 @@ import {
 import { useResolvedRecommendedModels } from '@/hooks/useResolvedRecommendedModels'
 import { useGeneralSetting } from '@/hooks/useGeneralSetting'
 import { useModelLoad } from '@/hooks/useModelLoad'
+import { switchToModel } from '@/utils/switchModel'
+import { markSilentImport } from '@/utils/backgroundImports'
 import HeaderPage from './HeaderPage'
 import SetupBackendStep from './SetupBackendStep'
-import SetupLocalModelsStep from './SetupLocalModelsStep'
+import { ModelSourceBadge } from '@/components/ModelSourceBadge'
 import {
   scanLocalModels,
   collectImportedModelPaths,
@@ -55,6 +57,14 @@ function formatDownloadGb(bytes: number): string {
   return (bytes / 1024 ** 3).toFixed(2)
 }
 
+//* Размер найденной на диске модели (байты → "4.50 GB" / "850 MB")
+function formatDetectedSize(bytes?: number): string | null {
+  if (!bytes || bytes <= 0) return null
+  const gb = bytes / 1024 ** 3
+  if (gb >= 1) return `${gb.toFixed(2)} GB`
+  return `${Math.max(1, Math.round(bytes / 1024 ** 2))} MB`
+}
+
 //* Числовой размер в ГБ из строки каталога ("4.5 GB" / "850 MB") для аналитики.
 function sizeStringToGb(size?: string): number | undefined {
   if (!size) return undefined
@@ -64,7 +74,7 @@ function sizeStringToGb(size?: string): number | undefined {
 
   const value = Number(match[1])
   if (!Number.isFinite(value)) return undefined
-  
+
   const gb = match[2].toUpperCase() === 'GB' ? value : value / 1024
   return Math.round(gb * 100) / 100
 }
@@ -81,11 +91,11 @@ type SetupScreenProps = {
 ///     to download the optimal llama.cpp backend. Skipped on macOS/Linux
 ///     and on Windows after the user has been through it once
 ///     (`localStorageKey.llamacppOnboardingDone` is set).
-///   - 'local' — one-click import of models already downloaded by other apps
-///     (LM Studio / HF cache / Unsloth). Shown only when the scanner finds
-///     candidates, between 'backend' and 'model'.
-///   - 'model' — the existing model recommendation/selection screen.
-type OnboardingStep = 'backend' | 'local' | 'model'
+///   - 'model' — model selection screen. Models already on disk (detected by
+///     the local scanner — LM Studio / HF cache / Unsloth / Ollama) are listed
+///     at the top with a "Run" button (one-click import, no re-download); the
+///     recommended catalog models follow below with a "Download" button.
+type OnboardingStep = 'backend' | 'model'
 
 function getInitialStep(): OnboardingStep {
   if (typeof window === 'undefined') return 'model'
@@ -156,25 +166,35 @@ function SetupScreen({ onSkipped }: SetupScreenProps) {
     Map<string, LocalLlamacppProvider | 'mlx'>
   >(new Map())
   const hasNavigatedRef = useRef(false)
+  // Imported only after the chosen model is handled (see handleImportedId), so
+  // their fast imports can't flip the route before a large pick finishes.
+  const pendingBackgroundImportsRef = useRef<LocalModelCandidate[]>([])
+  const importCandidatesInBackgroundRef = useRef<
+    (cands: LocalModelCandidate[]) => void
+  >(() => {})
 
   // Local-model detection: null = still scanning, [] = nothing found. We never
   // block onboarding on a slow scan (4s safety timeout below).
   const [localCandidates, setLocalCandidates] = useState<
     LocalModelCandidate[] | null
   >(null)
-  const [localStepResolved, setLocalStepResolved] = useState(false)
   const [importingLocalId, setImportingLocalId] = useState<string | null>(null)
 
   useEffect(() => {
     fetchSources()
   }, [fetchSources])
 
-  // Onboarding owns the whole screen: a model that crashed on auto-start (e.g. a
-  // stale lastUsedModel) must not throw its raw stderr toast over the setup flow.
+  // Onboarding owns model launching for the duration of the setup screen, so
+  // DataProvider must stand down from auto-launching the background bulk-imports
+  // (see DataProvider.handleModelImported). Error toasts are NOT muted here —
+  // every onboarding load is dispatched with `isAutoStart`, which already keeps
+  // failed auto-starts silent. We still clear any stale toast on entry.
   useEffect(() => {
-    useModelLoad.getState().setSuppressErrorToast(true)
+    useModelLoad.getState().setOnboardingActive(true)
     toast.dismiss('model-load-error')
-    return () => useModelLoad.getState().setSuppressErrorToast(false)
+    return () => {
+      useModelLoad.getState().setOnboardingActive(false)
+    }
   }, [])
 
   // Scan once for models from other apps (honors Settings toggle/folders + dedup).
@@ -190,11 +210,33 @@ function SetupScreen({ onSkipped }: SetupScreenProps) {
       useModelProvider.getState().providers
     )
 
-    void scanLocalModels({ enabled, extraRoots: localScanFolders, importedPaths })
+    // TEMP debug: see exactly what the onboarding scan returns + dedup inputs.
+    console.debug('[SetupScreen] local scan start', {
+      enabled,
+      localScanFolders,
+      importedPaths,
+    })
+
+    void scanLocalModels({
+      enabled,
+      extraRoots: localScanFolders,
+      importedPaths,
+    })
       .then((found) => {
+        console.debug('[SetupScreen] local scan result', {
+          total: found.length,
+          runnable: found.filter((c) => c.runnable).length,
+          candidates: found.map((c) => ({
+            id: c.id,
+            source: c.source,
+            runnable: c.runnable,
+            path: c.path,
+          })),
+        })
         if (!cancelled) setLocalCandidates(found)
       })
-      .catch(() => {
+      .catch((err) => {
+        console.debug('[SetupScreen] local scan failed', err)
         if (!cancelled) setLocalCandidates([])
       })
     return () => {
@@ -203,21 +245,15 @@ function SetupScreen({ onSkipped }: SetupScreenProps) {
     }
   }, [])
 
-  // Promote to the 'local' step once the scan finds candidates, but only when
-  // we'd otherwise be showing the model picker (i.e. not mid-backend-step and
-  // the user hasn't already passed/skipped the local step).
-  useEffect(() => {
-    if (
-      step === 'model' &&
-      !localStepResolved &&
-      localCandidates &&
-      localCandidates.length > 0
-    ) {
-      setStep('local')
-    }
-  }, [step, localStepResolved, localCandidates])
-
   const recommendedItems = useResolvedRecommendedModels(sources)
+
+  // Detected-on-disk models shown at the top of the picker. Only runnable
+  // candidates get a Run button (LoRA adapters need a base model first, so
+  // they're omitted from onboarding).
+  const detectedRunnable = useMemo(
+    () => (localCandidates ?? []).filter((c) => c.runnable),
+    [localCandidates]
+  )
 
   //* P0 онбординг-аналитика: фиксируем показ экрана выбора модели один раз,
   //* дождавшись резолва списка рекомендаций (иначе recommended_count = 0).
@@ -293,13 +329,10 @@ function SetupScreen({ onSkipped }: SetupScreenProps) {
   //* MLX: id в реестре провайдера. ВАЖНО: MLX-движок использует свой sanitizer
   //* (сохраняет точки, пробелы → '-'), отличный от @/lib/utils.sanitizeModelId
   //* (который бы схлопнул '.' → '_'). Дублируем логику MlxModelDownloadAction.
-  const getMlxModelId = useCallback(
-    (catalog: CatalogModel) => {
-      const raw = catalog.model_name.split('/').pop() ?? catalog.model_name
-      return raw.replace(/\s+/g, '-').replace(/[^a-zA-Z0-9\-_./]/g, '')
-    },
-    []
-  )
+  const getMlxModelId = useCallback((catalog: CatalogModel) => {
+    const raw = catalog.model_name.split('/').pop() ?? catalog.model_name
+    return raw.replace(/\s+/g, '-').replace(/[^a-zA-Z0-9\-_./]/g, '')
+  }, [])
 
   const isMlxDownloaded = useCallback(
     (catalog: CatalogModel) => {
@@ -313,6 +346,52 @@ function SetupScreen({ onSkipped }: SetupScreenProps) {
     },
     [mlxProvider, getMlxModelId]
   )
+
+  //* Уже установленные рекомендованные модели переезжают в секцию «На вашем
+  //* устройстве» с живой кнопкой запуска; остальные остаются в рекомендациях.
+  const { installedRecommended, pendingRecommended } = useMemo(() => {
+    const installed: Array<{
+      rec: (typeof recommendedItems)[number]['rec']
+      model: CatalogModel
+      startId: string
+      provider: LocalLlamacppProvider | 'mlx'
+      sizeLabel: string | null | undefined
+    }> = []
+    const pending: typeof recommendedItems = []
+
+    for (const item of recommendedItems) {
+      const { model } = item
+      if (!model) {
+        pending.push(item)
+        continue
+      }
+      const isMlx = !!model.is_mlx
+      const variant = !isMlx ? pickPreferredVariant(model) : null
+      const downloaded = isMlx
+        ? isMlxDownloaded(model)
+        : variant
+          ? isVariantDownloaded(model, variant)
+          : false
+
+      if (downloaded) {
+        installed.push({
+          rec: item.rec,
+          model,
+          startId: isMlx ? getMlxModelId(model) : variant!.model_id,
+          provider: (isMlx ? 'mlx' : LOCAL_LLAMACPP_PROVIDER) as
+            | LocalLlamacppProvider
+            | 'mlx',
+          sizeLabel: isMlx
+            ? getMlxTotalFileSize(model)
+            : getTotalDownloadFileSize(model, variant!),
+        })
+      } else {
+        pending.push(item)
+      }
+    }
+
+    return { installedRecommended: installed, pendingRecommended: pending }
+  }, [recommendedItems, isMlxDownloaded, isVariantDownloaded, getMlxModelId])
 
   const startDownload = useCallback(
     (catalog: CatalogModel, variant: ModelQuant) => {
@@ -421,15 +500,19 @@ function SetupScreen({ onSkipped }: SetupScreenProps) {
 
       const catalogId = importedId
       const backslashId = catalogId.replace(/\//g, '\\')
-      const found =
-        selectModelProvider(providerName, catalogId) ||
-        selectModelProvider(providerName, backslashId)
+
+      // Select up-front so the dropdown "first local" fallback can't override it.
+      const prov = providers.find((p) => p.provider === providerName)
+      const found = prov?.models.find(
+        (m) => m.id === catalogId || m.id === backslashId
+      )
       const modelId = found ? found.id : catalogId
+      selectModelProvider(providerName, modelId)
 
       toast.dismiss(`model-validation-started-${catalogId}`)
       localStorage.setItem(localStorageKey.setupCompleted, 'true')
-      // Notify the root layout so it can mount the global BackendUpdater
-      // dialog now that the dedicated onboarding flow has completed.
+
+      // Lets the root layout mount the global BackendUpdater now onboarding is done.
       window.dispatchEvent(new Event('app:setup-completed'))
       localStorage.setItem(
         localStorageKey.lastUsedModel,
@@ -438,6 +521,19 @@ function SetupScreen({ onSkipped }: SetupScreenProps) {
 
       // Onboarding ran with the sidebar collapsed; entering chat opens it.
       useLeftPanel.getState().setLeftPanel(true)
+
+      // Add the rest only now, so they can't flip the route before this pick.
+      const rest = pendingBackgroundImportsRef.current
+      pendingBackgroundImportsRef.current = []
+      if (rest.length) importCandidatesInBackgroundRef.current(rest)
+
+      // Explicit user pick (not an auto-start) so a load error surfaces on the
+      // model they clicked. Fire-and-forget so nav isn't blocked on weights.
+      void switchToModel({
+        modelId,
+        providerName,
+        serviceHub,
+      }).catch(() => {})
 
       navigate({
         to: route.home,
@@ -510,12 +606,8 @@ function SetupScreen({ onSkipped }: SetupScreenProps) {
     []
   )
 
-  // Fire-and-forget import of runnable candidates into the library — no launch,
-  // no navigation (they're not tracked). Importing is ~free (a model.yml that
-  // points at the existing file; for Ollama, a symlink — no gigabyte copy), so
-  // we add every detected model regardless of what the user does next. A single
-  // failure mustn't block the others; once all settle, refresh the library so
-  // they appear even if this screen has moved on.
+  // Fire-and-forget library imports (no launch/navigation). Once all settle,
+  // refresh the library so they appear even if this screen has moved on.
   const importCandidatesInBackground = useCallback(
     (cands: LocalModelCandidate[]) => {
       const runnable = cands.filter((c) => c.runnable)
@@ -523,6 +615,8 @@ function SetupScreen({ onSkipped }: SetupScreenProps) {
       const imports = runnable.map((c) => {
         const eng = EngineManager.instance().get(providerForCandidate(c))
         if (!eng) return Promise.resolve()
+        // Mark silent so DataProvider's import handler never auto-launches it.
+        markSilentImport(c.id)
         return eng
           .import(c.id, {
             modelPath: c.path,
@@ -543,15 +637,13 @@ function SetupScreen({ onSkipped }: SetupScreenProps) {
     [providerForCandidate, serviceHub, setProviders]
   )
 
-  // Import a model detected on disk (no download). The engine writes a
-  // model.yml pointing at the existing file and emits AppEvent.onModelImported,
-  // which the effect above turns into navigation into chat.
-  //
-  // Importing is ~free (just a model.yml referencing the existing file; for
-  // Ollama, a symlink — no gigabyte copy), so when several models are detected
-  // we also import the rest in the background. The user launches the one they
-  // clicked, and every other detected model still lands in the library without
-  // re-download — nothing is lost, no extra clicks.
+  // Keeps the ref current for the earlier onModelImported effect.
+  useEffect(() => {
+    importCandidatesInBackgroundRef.current = importCandidatesInBackground
+  }, [importCandidatesInBackground])
+
+  // Import the picked model (no download) and launch it; the rest are imported
+  // in the background so every detected model lands in the library.
   const onRunLocalModel = useCallback(
     async (cand: LocalModelCandidate) => {
       if (!cand.runnable || importingLocalId) return
@@ -568,9 +660,9 @@ function SetupScreen({ onSkipped }: SetupScreenProps) {
       // Only the chosen model is tracked, so only it triggers navigation.
       trackedImportIdsRef.current.set(cand.id, providerName)
 
-      // Add every other detected model to the library in the background.
-      importCandidatesInBackground(
-        (localCandidates ?? []).filter((c) => c.id !== cand.id)
+      // Deferred until the chosen model is handled (see handleImportedId).
+      pendingBackgroundImportsRef.current = (localCandidates ?? []).filter(
+        (c) => c.id !== cand.id
       )
 
       try {
@@ -582,6 +674,10 @@ function SetupScreen({ onSkipped }: SetupScreenProps) {
       } catch (error) {
         trackedImportIdsRef.current.delete(cand.id)
         setImportingLocalId(null)
+        // Chosen model failed, so add the rest here (handleImportedId won't).
+        const rest = pendingBackgroundImportsRef.current
+        pendingBackgroundImportsRef.current = []
+        if (rest.length) importCandidatesInBackground(rest)
         toast.error(t('setup:localStep.importFailed'), {
           description: error instanceof Error ? error.message : 'Unknown error',
         })
@@ -596,16 +692,9 @@ function SetupScreen({ onSkipped }: SetupScreenProps) {
     ]
   )
 
-  // "Browse the catalog instead": the user skips running a detected model, but
-  // detected models must still land in the library no matter what — so import
-  // them all (no launch) before moving on to the default download flow.
-  const handleLocalSkip = useCallback(() => {
-    importCandidatesInBackground(localCandidates ?? [])
-    setLocalStepResolved(true)
-    setStep('model')
-  }, [importCandidatesInBackground, localCandidates])
-
   const handleSkip = useCallback(() => {
+    // Still import every detected model (no launch) before leaving onboarding.
+    importCandidatesInBackground(localCandidates ?? [])
     try {
       const hadAnyModel = providers.some(
         (p) => (p.models?.length ?? 0) > 0 || !!p.api_key
@@ -632,7 +721,13 @@ function SetupScreen({ onSkipped }: SetupScreenProps) {
       replace: true,
       search: {},
     })
-  }, [navigate, onSkipped, providers])
+  }, [
+    navigate,
+    onSkipped,
+    providers,
+    importCandidatesInBackground,
+    localCandidates,
+  ])
 
   // Windows: dedicated llama.cpp backend step runs first. Once the user
   // either downloads or skips it the flag is persisted so subsequent
@@ -641,19 +736,9 @@ function SetupScreen({ onSkipped }: SetupScreenProps) {
     return <SetupBackendStep onDone={handleBackendStepDone} />
   }
 
-  if (step === 'local' && localCandidates && localCandidates.length > 0) {
-    return (
-      <SetupLocalModelsStep
-        candidates={localCandidates}
-        importingId={importingLocalId}
-        onRun={onRunLocalModel}
-        onSkip={handleLocalSkip}
-      />
-    )
-  }
-
-  // Brief scanning state so we don't flash the model picker when locals exist.
-  if (step === 'model' && !localStepResolved && localCandidates === null) {
+  // Brief scanning state so detected models can appear at the top of the
+  // picker on first paint instead of popping in (and shoving the list down).
+  if (step === 'model' && localCandidates === null) {
     return (
       <div className="relative flex h-svh w-full flex-col overflow-hidden">
         <HeaderPage hideControls />
@@ -695,204 +780,388 @@ function SetupScreen({ onSkipped }: SetupScreenProps) {
               </p>
             </div>
 
-            <div className="relative z-50 flex flex-col gap-2">
-              <div className="flex flex-col gap-2">
-                <span className="shrink-0 text-left text-xs font-medium text-muted-foreground">
-                  {t('hub:recTitle')}
-                </span>
-                <div
-                  className={cn(
-                    //* +20% только к внутренним отступам «карточки» (рамка со списком)
-                    'w-full shrink-0 rounded-lg border bg-secondary/50 p-[0.9rem] sm:p-[1.2rem]',
-                    'max-h-[min(70vh,36rem)] overflow-y-auto overscroll-y-contain [scrollbar-gutter:stable]'
-                  )}
-                >
-                  <div className="flex flex-col divide-y divide-border/60">
-                    {recommendedItems.map(({ rec, model }, index) => {
-                      const isMlx = !!model?.is_mlx
-                      const variant =
-                        model && !isMlx ? pickPreferredVariant(model) : null
-                      //* MLX: суммируем все safetensors-шарды; GGUF: quant + mmproj
-                      const downloadSize = isMlx
-                        ? getMlxTotalFileSize(model!)
-                        : model && variant
-                          ? getTotalDownloadFileSize(model, variant)
-                          : variant?.file_size
-                      //* id, по которому опрашиваем downloadStore (GGUF → quant.id, MLX → mlxId)
-                      const rowTrackId = isMlx
-                        ? model
-                          ? getMlxModelId(model)
-                          : null
-                        : variant?.model_id ?? null
-                      const rowDownloading = rowTrackId
-                        ? isVariantDownloading(rowTrackId)
-                        : false
-                      const rowDownloaded = isMlx
-                        ? model
-                          ? isMlxDownloaded(model)
-                          : false
-                        : model && variant
-                          ? isVariantDownloaded(model, variant)
-                          : false
-                      const hfAuthor =
-                        model?.developer?.trim() ||
-                        rec.modelName.split('/')[0]?.trim() ||
-                        ''
-                      const nameForInitials =
-                        extractModelName(rec.modelName) || rec.modelName || '?'
-                      const rowInitials =
-                        nameForInitials
-                          .replace(/\.(gguf|GGUF)$/i, '')
-                          .replace(/[^a-zA-Z0-9]/g, '')
-                          .slice(0, 2) ||
-                        hfAuthor.slice(0, 2) ||
-                        '?'
+            <div className="relative z-50 flex flex-col gap-4">
+              {(detectedRunnable.length > 0 ||
+                installedRecommended.length > 0) && (
+                <div className="flex flex-col gap-2">
+                  <span className="shrink-0 text-left text-xs font-medium text-muted-foreground">
+                    {t('setup:localStep.onDeviceTitle')}
+                  </span>
+                  <div
+                    className={cn(
+                      'w-full shrink-0 rounded-lg border bg-secondary/50 p-[0.9rem] sm:p-[1.2rem]',
+                      'max-h-[min(40vh,22rem)] overflow-y-auto overscroll-y-contain [scrollbar-gutter:stable]'
+                    )}
+                  >
+                    <div className="flex flex-col divide-y divide-border/60">
+                      {detectedRunnable.map((cand) => {
+                        const brandIconSrc = recommendedSetupModelIconSrc(
+                          cand.displayName
+                        )
+                        const rowInitials =
+                          cand.displayName
+                            .replace(/\.(gguf|GGUF)$/i, '')
+                            .replace(/[^a-zA-Z0-9]/g, '')
+                            .slice(0, 2) || '?'
+                        const size = formatDetectedSize(cand.sizeBytes)
+                        const isImporting = importingLocalId === cand.id
 
-                      const brandIconSrc = recommendedSetupModelIconSrc(
-                        rec.modelName
-                      )
-                      const rowDownloadProgress = rowTrackId
-                        ? downloadProcesses.find((p) => p.id === rowTrackId)
-                        : undefined
-
-                      return (
-                        <div
-                          key={`${rec.modelName}-${rec.descriptionKey}`}
-                          className="flex flex-col gap-3 py-4 first:pt-0 last:pb-0 sm:flex-row sm:items-start sm:justify-between sm:gap-4"
-                        >
-                          <div className="flex min-w-0 flex-1 items-start gap-3">
-                            {brandIconSrc ? (
-                              <img
-                                src={brandIconSrc}
-                                alt=""
-                                className="size-11 shrink-0 object-contain sm:size-12"
-                                draggable={false}
-                                aria-hidden
-                              />
-                            ) : (
-                              <HuggingFaceAuthorAvatar
-                                author={hfAuthor}
-                                initials={rowInitials}
-                                className="size-11 shrink-0 sm:size-12"
-                              />
-                            )}
-                            <div className="min-w-0 flex-1">
-                              <h2 className="font-semibold text-sm leading-tight sm:text-base sm:whitespace-nowrap">
-                                {model
-                                  ? extractModelName(model.model_name)
-                                  : extractModelName(rec.modelName)}
-                                {downloadSize ? (
-                                  <span className="text-xs font-normal text-muted-foreground">
-                                    {' '}
-                                    · {downloadSize}
-                                  </span>
-                                ) : null}
-                              </h2>
-                              <RecommendedModelChip
-                                className="mt-1.5 inline-flex max-w-full sm:max-w-md"
-                                variant={chipVariantForRecommendedDescriptionKey(
-                                  rec.descriptionKey
-                                )}
-                                title={t(rec.descriptionKey)}
-                              >
-                                {t(rec.descriptionKey)}
-                              </RecommendedModelChip>
-                              {!model && (
-                                <p className="mt-1 text-xs text-muted-foreground">
-                                  {sourcesLoading
-                                    ? t('hub:loadingModels')
-                                    : t('setup:modelUnavailable')}
-                                </p>
+                        return (
+                          <div
+                            key={cand.id}
+                            className="flex flex-col gap-3 py-4 first:pt-0 last:pb-0 sm:flex-row sm:items-start sm:justify-between sm:gap-4"
+                          >
+                            <div className="flex min-w-0 flex-1 items-start gap-3">
+                              {brandIconSrc ? (
+                                <img
+                                  src={brandIconSrc}
+                                  alt=""
+                                  className="size-11 shrink-0 object-contain sm:size-12"
+                                  draggable={false}
+                                  aria-hidden
+                                />
+                              ) : (
+                                <HuggingFaceAuthorAvatar
+                                  author=""
+                                  initials={rowInitials}
+                                  className="size-11 shrink-0 sm:size-12"
+                                />
                               )}
+                              <div className="min-w-0 flex-1">
+                                <h2
+                                  className="font-semibold text-sm leading-tight sm:text-base sm:whitespace-nowrap"
+                                  title={cand.path}
+                                >
+                                  {cand.displayName}
+                                  {size ? (
+                                    <span className="text-xs font-normal text-muted-foreground">
+                                      {' '}
+                                      · {size}
+                                    </span>
+                                  ) : null}
+                                </h2>
+                                <div className="mt-1.5 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-xs text-muted-foreground">
+                                  <ModelSourceBadge source={cand.source} />
+                                </div>
+                              </div>
+                            </div>
+                            <div className="flex w-full flex-col items-center gap-1 sm:w-auto sm:shrink-0">
+                              <Button
+                                size="sm"
+                                disabled={importingLocalId !== null}
+                                onClick={() => onRunLocalModel(cand)}
+                                className="w-full shrink-0 rounded-full px-5 font-semibold sm:w-auto"
+                              >
+                                <span className="grid">
+                                  <span
+                                    aria-hidden="true"
+                                    className="invisible col-start-1 row-start-1"
+                                  >
+                                    {t('setup:localStep.running')}
+                                  </span>
+                                  <span className="col-start-1 row-start-1">
+                                    {isImporting
+                                      ? t('setup:localStep.running')
+                                      : t('setup:localStep.run')}
+                                  </span>
+                                </span>
+                              </Button>
                             </div>
                           </div>
-                          <div className="flex w-full flex-col items-center gap-1 sm:w-auto sm:shrink-0">
-                            <Button
-                              size="sm"
-                              disabled={
-                                !model ||
-                                (!isMlx && !variant) ||
-                                rowDownloading ||
-                                rowDownloaded
-                              }
-                              onClick={() => {
-                                if (!model) return
-                                if (isMlx) {
-                                  captureRecommendedClick({
-                                    modelId: getMlxModelId(model),
-                                    format: 'MLX',
-                                    sizeGb: sizeStringToGb(downloadSize),
-                                    position: index,
-                                  })
-                                  void startMlxDownload(model)
-                                  enterChatForDownload(
-                                    getMlxModelId(model),
-                                    'mlx'
-                                  )
-                                } else if (variant) {
-                                  captureRecommendedClick({
-                                    modelId: variant.model_id,
-                                    format: 'GGUF',
-                                    sizeGb: sizeStringToGb(downloadSize),
-                                    position: index,
-                                  })
-                                  startDownload(model, variant)
-                                  enterChatForDownload(
-                                    variant.model_id,
-                                    LOCAL_LLAMACPP_PROVIDER as LocalLlamacppProvider
-                                  )
-                                }
-                              }}
-                              className="w-full shrink-0 rounded-full px-5 font-semibold sm:w-auto"
+                        )
+                      })}
+                      {installedRecommended.map(
+                        ({ rec, model, startId, provider, sizeLabel }) => {
+                          const brandIconSrc = recommendedSetupModelIconSrc(
+                            rec.modelName
+                          )
+                          const hfAuthor =
+                            model.developer?.trim() ||
+                            rec.modelName.split('/')[0]?.trim() ||
+                            ''
+                          const rowInitials =
+                            (extractModelName(rec.modelName) || rec.modelName)
+                              .replace(/\.(gguf|GGUF)$/i, '')
+                              .replace(/[^a-zA-Z0-9]/g, '')
+                              .slice(0, 2) ||
+                            hfAuthor.slice(0, 2) ||
+                            '?'
+
+                          return (
+                            <div
+                              key={`installed-${rec.modelName}-${rec.descriptionKey}`}
+                              className="flex flex-col gap-3 py-4 first:pt-0 last:pb-0 sm:flex-row sm:items-start sm:justify-between sm:gap-4"
                             >
-                              {/* Reserve width for the widest possible label so the
-                                  button doesn't reflow when its state flips between
-                                  Download / Downloading… / Downloaded. */}
-                              <span className="grid">
-                                <span
-                                  aria-hidden="true"
-                                  className="invisible col-start-1 row-start-1"
+                              <div className="flex min-w-0 flex-1 items-start gap-3">
+                                {brandIconSrc ? (
+                                  <img
+                                    src={brandIconSrc}
+                                    alt=""
+                                    className="size-11 shrink-0 object-contain sm:size-12"
+                                    draggable={false}
+                                    aria-hidden
+                                  />
+                                ) : (
+                                  <HuggingFaceAuthorAvatar
+                                    author={hfAuthor}
+                                    initials={rowInitials}
+                                    className="size-11 shrink-0 sm:size-12"
+                                  />
+                                )}
+                                <div className="min-w-0 flex-1">
+                                  <h2 className="font-semibold text-sm leading-tight sm:text-base sm:whitespace-nowrap">
+                                    {extractModelName(model.model_name)}
+                                    {sizeLabel ? (
+                                      <span className="text-xs font-normal text-muted-foreground">
+                                        {' '}
+                                        · {sizeLabel}
+                                      </span>
+                                    ) : null}
+                                  </h2>
+                                  <RecommendedModelChip
+                                    className="mt-1.5 inline-flex max-w-full sm:max-w-md"
+                                    variant={chipVariantForRecommendedDescriptionKey(
+                                      rec.descriptionKey
+                                    )}
+                                    title={t(rec.descriptionKey)}
+                                  >
+                                    {t(rec.descriptionKey)}
+                                  </RecommendedModelChip>
+                                </div>
+                              </div>
+                              <div className="flex w-full flex-col items-center gap-1 sm:w-auto sm:shrink-0">
+                                <Button
+                                  size="sm"
+                                  disabled={importingLocalId !== null}
+                                  onClick={() => {
+                                    importCandidatesInBackground(
+                                      localCandidates ?? []
+                                    )
+                                    enterChatForDownload(startId, provider)
+                                  }}
+                                  className="w-full shrink-0 rounded-full px-5 font-semibold sm:w-auto"
                                 >
-                                  {t('setup:downloading')}
-                                </span>
-                                <span
-                                  aria-hidden="true"
-                                  className="invisible col-start-1 row-start-1"
-                                >
-                                  {t('hub:downloaded')}
-                                </span>
-                                <span
-                                  aria-hidden="true"
-                                  className="invisible col-start-1 row-start-1"
-                                >
-                                  {t('hub:download')}
-                                </span>
-                                <span className="col-start-1 row-start-1">
-                                  {rowDownloaded
-                                    ? t('hub:downloaded')
-                                    : rowDownloading
-                                      ? t('setup:downloading')
-                                      : t('hub:download')}
-                                </span>
-                              </span>
-                            </Button>
-                            {rowDownloading && rowTrackId ? (
-                              <p
-                                className="w-full text-center text-xs text-muted-foreground tabular-nums sm:w-auto sm:max-w-full"
-                                aria-live="polite"
-                              >
-                                {rowDownloadProgress &&
-                                rowDownloadProgress.total > 0
-                                  ? `${Math.round((rowDownloadProgress.progress ?? 0) * 100)}% · ${formatDownloadGb(rowDownloadProgress.current)} / ${formatDownloadGb(rowDownloadProgress.total)} GB`
-                                  : t('setup:downloadPreparing')}
-                              </p>
-                            ) : null}
-                          </div>
-                        </div>
-                      )
-                    })}
+                                  {t('setup:localStep.run')}
+                                </Button>
+                              </div>
+                            </div>
+                          )
+                        }
+                      )}
+                    </div>
                   </div>
                 </div>
+              )}
+
+              <div className="flex flex-col gap-2">
+                {pendingRecommended.length > 0 && (
+                  <>
+                    <span className="shrink-0 text-left text-xs font-medium text-muted-foreground">
+                      {t('hub:recTitle')}
+                    </span>
+                    <div
+                      className={cn(
+                        //* +20% только к внутренним отступам «карточки» (рамка со списком)
+                        'w-full shrink-0 rounded-lg border bg-secondary/50 p-[0.9rem] sm:p-[1.2rem]',
+                        'max-h-[min(70vh,36rem)] overflow-y-auto overscroll-y-contain [scrollbar-gutter:stable]'
+                      )}
+                    >
+                      <div className="flex flex-col divide-y divide-border/60">
+                        {pendingRecommended.map(({ rec, model }, index) => {
+                          const isMlx = !!model?.is_mlx
+                          const variant =
+                            model && !isMlx ? pickPreferredVariant(model) : null
+                          //* MLX: суммируем все safetensors-шарды; GGUF: quant + mmproj
+                          const downloadSize = isMlx
+                            ? getMlxTotalFileSize(model!)
+                            : model && variant
+                              ? getTotalDownloadFileSize(model, variant)
+                              : variant?.file_size
+                          //* id, по которому опрашиваем downloadStore (GGUF → quant.id, MLX → mlxId)
+                          const rowTrackId = isMlx
+                            ? model
+                              ? getMlxModelId(model)
+                              : null
+                            : (variant?.model_id ?? null)
+                          const rowDownloading = rowTrackId
+                            ? isVariantDownloading(rowTrackId)
+                            : false
+                          const rowDownloaded = isMlx
+                            ? model
+                              ? isMlxDownloaded(model)
+                              : false
+                            : model && variant
+                              ? isVariantDownloaded(model, variant)
+                              : false
+                          const hfAuthor =
+                            model?.developer?.trim() ||
+                            rec.modelName.split('/')[0]?.trim() ||
+                            ''
+                          const nameForInitials =
+                            extractModelName(rec.modelName) ||
+                            rec.modelName ||
+                            '?'
+                          const rowInitials =
+                            nameForInitials
+                              .replace(/\.(gguf|GGUF)$/i, '')
+                              .replace(/[^a-zA-Z0-9]/g, '')
+                              .slice(0, 2) ||
+                            hfAuthor.slice(0, 2) ||
+                            '?'
+
+                          const brandIconSrc = recommendedSetupModelIconSrc(
+                            rec.modelName
+                          )
+                          const rowDownloadProgress = rowTrackId
+                            ? downloadProcesses.find((p) => p.id === rowTrackId)
+                            : undefined
+
+                          return (
+                            <div
+                              key={`${rec.modelName}-${rec.descriptionKey}`}
+                              className="flex flex-col gap-3 py-4 first:pt-0 last:pb-0 sm:flex-row sm:items-start sm:justify-between sm:gap-4"
+                            >
+                              <div className="flex min-w-0 flex-1 items-start gap-3">
+                                {brandIconSrc ? (
+                                  <img
+                                    src={brandIconSrc}
+                                    alt=""
+                                    className="size-11 shrink-0 object-contain sm:size-12"
+                                    draggable={false}
+                                    aria-hidden
+                                  />
+                                ) : (
+                                  <HuggingFaceAuthorAvatar
+                                    author={hfAuthor}
+                                    initials={rowInitials}
+                                    className="size-11 shrink-0 sm:size-12"
+                                  />
+                                )}
+                                <div className="min-w-0 flex-1">
+                                  <h2 className="font-semibold text-sm leading-tight sm:text-base sm:whitespace-nowrap">
+                                    {model
+                                      ? extractModelName(model.model_name)
+                                      : extractModelName(rec.modelName)}
+                                    {downloadSize ? (
+                                      <span className="text-xs font-normal text-muted-foreground">
+                                        {' '}
+                                        · {downloadSize}
+                                      </span>
+                                    ) : null}
+                                  </h2>
+                                  <RecommendedModelChip
+                                    className="mt-1.5 inline-flex max-w-full sm:max-w-md"
+                                    variant={chipVariantForRecommendedDescriptionKey(
+                                      rec.descriptionKey
+                                    )}
+                                    title={t(rec.descriptionKey)}
+                                  >
+                                    {t(rec.descriptionKey)}
+                                  </RecommendedModelChip>
+                                  {!model && (
+                                    <p className="mt-1 text-xs text-muted-foreground">
+                                      {sourcesLoading
+                                        ? t('hub:loadingModels')
+                                        : t('setup:modelUnavailable')}
+                                    </p>
+                                  )}
+                                </div>
+                              </div>
+                              <div className="flex w-full flex-col items-center gap-1 sm:w-auto sm:shrink-0">
+                                <Button
+                                  size="sm"
+                                  disabled={
+                                    !model ||
+                                    (!isMlx && !variant) ||
+                                    rowDownloading ||
+                                    rowDownloaded
+                                  }
+                                  onClick={() => {
+                                    if (!model) return
+                                    // Detected-on-disk models still land in the
+                                    // library even when the user downloads a
+                                    // catalog model instead of running them.
+                                    importCandidatesInBackground(
+                                      localCandidates ?? []
+                                    )
+                                    if (isMlx) {
+                                      captureRecommendedClick({
+                                        modelId: getMlxModelId(model),
+                                        format: 'MLX',
+                                        sizeGb: sizeStringToGb(downloadSize),
+                                        position: index,
+                                      })
+                                      void startMlxDownload(model)
+                                      enterChatForDownload(
+                                        getMlxModelId(model),
+                                        'mlx'
+                                      )
+                                    } else if (variant) {
+                                      captureRecommendedClick({
+                                        modelId: variant.model_id,
+                                        format: 'GGUF',
+                                        sizeGb: sizeStringToGb(downloadSize),
+                                        position: index,
+                                      })
+                                      startDownload(model, variant)
+                                      enterChatForDownload(
+                                        variant.model_id,
+                                        LOCAL_LLAMACPP_PROVIDER as LocalLlamacppProvider
+                                      )
+                                    }
+                                  }}
+                                  className="w-full shrink-0 rounded-full px-5 font-semibold sm:w-auto"
+                                >
+                                  {/* Reserve width for the widest possible label so the
+                                  button doesn't reflow when its state flips between
+                                  Download / Downloading… / Downloaded. */}
+                                  <span className="grid">
+                                    <span
+                                      aria-hidden="true"
+                                      className="invisible col-start-1 row-start-1"
+                                    >
+                                      {t('setup:downloading')}
+                                    </span>
+                                    <span
+                                      aria-hidden="true"
+                                      className="invisible col-start-1 row-start-1"
+                                    >
+                                      {t('hub:downloaded')}
+                                    </span>
+                                    <span
+                                      aria-hidden="true"
+                                      className="invisible col-start-1 row-start-1"
+                                    >
+                                      {t('hub:download')}
+                                    </span>
+                                    <span className="col-start-1 row-start-1">
+                                      {rowDownloaded
+                                        ? t('hub:downloaded')
+                                        : rowDownloading
+                                          ? t('setup:downloading')
+                                          : t('hub:download')}
+                                    </span>
+                                  </span>
+                                </Button>
+                                {rowDownloading && rowTrackId ? (
+                                  <p
+                                    className="w-full text-center text-xs text-muted-foreground tabular-nums sm:w-auto sm:max-w-full"
+                                    aria-live="polite"
+                                  >
+                                    {rowDownloadProgress &&
+                                    rowDownloadProgress.total > 0
+                                      ? `${Math.round((rowDownloadProgress.progress ?? 0) * 100)}% · ${formatDownloadGb(rowDownloadProgress.current)} / ${formatDownloadGb(rowDownloadProgress.total)} GB`
+                                      : t('setup:downloadPreparing')}
+                                  </p>
+                                ) : null}
+                              </div>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    </div>
+                  </>
+                )}
 
                 <div className="relative z-60 flex shrink-0 flex-col items-center pt-3">
                   <Button
