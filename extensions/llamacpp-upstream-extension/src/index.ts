@@ -2948,7 +2948,26 @@ export default class llamacpp_upstream_extension extends AIEngine {
     }
 
     // Include prefix in the backend identifier if present
-    const backendIdentifier = prefix ? `${prefix}${backend}` : backend
+    const rawBackendIdentifier = prefix ? `${prefix}${backend}` : backend
+
+    // ATO-233: normalize ggml-org Ubuntu asset names (ubuntu-*) to the
+    // internal linux-* ids used throughout the extension. ggml-org tarballs
+    // are named `llama-bXXXX-bin-ubuntu-{vulkan,}-x64.tar.gz` on Linux, but
+    // the extension stores backends under `linux-vulkan-x64` / `linux-cpu-x64`
+    // so that findCompatibleInstalledBackend and the rest of the backend
+    // resolution machinery can find them by the correct internal id.
+    const backendIdentifier =
+      IS_LINUX && rawBackendIdentifier.startsWith('ubuntu-')
+        ? rawBackendIdentifier.includes('vulkan')
+          ? `linux-vulkan-${rawBackendIdentifier.includes('arm64') ? 'arm64' : 'x64'}`
+          : `linux-cpu-${rawBackendIdentifier.includes('arm64') ? 'arm64' : 'x64'}`
+        : rawBackendIdentifier
+
+    if (backendIdentifier !== rawBackendIdentifier) {
+      logger.info(
+        `[installBackend] Normalized archive backend name '${rawBackendIdentifier}' → '${backendIdentifier}'`
+      )
+    }
 
     logger.info(
       `Detected prefix: ${prefix || 'none'}, version: ${version}, backend: ${backendIdentifier}`
@@ -3464,9 +3483,28 @@ export default class llamacpp_upstream_extension extends AIEngine {
         )
         await this.configureBackendsPromise
       } else {
-        logger.info(
-          `Backend already configured (${vb}), loading model "${modelId}" without waiting for full backend list`
-        )
+        // ATO-233: also wait when the backend string is concrete but the exe
+        // is NOT locally installed yet. configureBackends may swap version_backend
+        // to an already-installed build (e.g. a bundled CPU backend after an
+        // app update that changed the bundled tag, or after a local compatible
+        // backend was found during startup). Without this check the load
+        // races ahead with a stale tag that is guaranteed to 404, causing the
+        // spinner to hang until resolveBackendFallback finishes.
+        const [vbVer, vbBack] = vb.split('/')
+        const vbIsInstalled =
+          !!vbVer?.trim() &&
+          !!vbBack?.trim() &&
+          (await isBackendInstalled(vbBack.trim(), vbVer.trim()))
+        if (!vbIsInstalled) {
+          logger.info(
+            `Backend ${vb} not installed locally; waiting for configureBackends before loading model "${modelId}"`
+          )
+          await this.configureBackendsPromise
+        } else {
+          logger.info(
+            `Backend already configured (${vb}), loading model "${modelId}" without waiting for full backend list`
+          )
+        }
       }
     }
 
@@ -4374,6 +4412,33 @@ export default class llamacpp_upstream_extension extends AIEngine {
         }
       }
       return { version, backend }
+    }
+
+    // ATO-233: Before attempting a network download (which may 404 or hang on
+    // a stale manifest tag), check whether a compatible backend of the SAME
+    // type is already installed locally at a DIFFERENT tag. Using the local
+    // copy avoids a failed/hanging download on the load path, and is the
+    // correct behaviour when the manifest tag drifts out of sync with what is
+    // actually present on the ggml-org CDN.
+    //
+    // Only applies on the load path (allowFallback=true). Explicit install/
+    // update flows keep the strict download-or-fail behaviour.
+    if (allowFallback) {
+      const sameTypeInstalled = await findCompatibleInstalledBackend(backend)
+      if (
+        sameTypeInstalled &&
+        (await isBackendInstalled(sameTypeInstalled.backend, sameTypeInstalled.version))
+      ) {
+        const localKey = `${sameTypeInstalled.version}/${sameTypeInstalled.backend}`
+        if (localKey !== backendKey) {
+          logger.warn(
+            `[ensureBackendReady] ${backendKey} not installed; found compatible local backend ` +
+              `${localKey} — using it without a network download (stale manifest tag or CDN 404).`
+          )
+          await this.persistVersionBackend(localKey)
+          return { version: sameTypeInstalled.version, backend: sameTypeInstalled.backend }
+        }
+      }
     }
 
     // ATO-179 (AC1): a stale, incomplete folder for this exact target (exists

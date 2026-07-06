@@ -236,6 +236,12 @@ pub fn _get_client_for_item(
     header_map: &HeaderMap,
 ) -> Result<reqwest::Client, String> {
     let mut client_builder = reqwest::Client::builder()
+        // ATO-233: a missing or renamed ggml-org release asset can leave the
+        // HEAD request in helpers.rs hanging indefinitely (the CDN accepts the
+        // TCP connection but never sends a response).  A 30-second connect
+        // timeout caps that worst-case wait so a stale manifest tag fails fast
+        // instead of blocking model load forever.
+        .connect_timeout(Duration::from_secs(30))
         .http2_keep_alive_timeout(Duration::from_secs(15))
         .default_headers(header_map.clone());
 
@@ -281,7 +287,9 @@ pub async fn _get_file_size(
     client: &reqwest::Client,
     url: &str,
 ) -> Result<u64, Box<dyn std::error::Error>> {
-    let resp = client.head(url).send().await?;
+    // ATO-233: 30-second per-request timeout so a slow or unresponsive CDN
+    // endpoint (e.g. a 404 redirect chain) fails fast rather than hanging.
+    let resp = client.head(url).timeout(Duration::from_secs(30)).send().await?;
     if !resp.status().is_success() {
         return Err(format!("Failed to get file size: HTTP status {}", resp.status()).into());
     }

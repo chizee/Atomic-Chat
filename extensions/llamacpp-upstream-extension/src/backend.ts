@@ -756,6 +756,33 @@ export async function isBackendInstalled(
 }
 
 /**
+ * Compute the set of backend type strings that are equivalent to `backendType`
+ * for the purpose of compatibility checking (ATO-233). In particular, ggml-org
+ * Linux tarballs carry `ubuntu-*` asset names (e.g. `ubuntu-vulkan-x64`), but
+ * the extension stores backends under `linux-*` internal ids
+ * (`linux-vulkan-x64`). Backends installed via "Install Backend from File"
+ * with an unpatched version of the app may therefore be on disk under the
+ * ubuntu name. This helper returns ALL names that should be treated as the
+ * same type so `findCompatibleInstalledBackend` can find them.
+ */
+function backendTypeEquivalents(backendType: string): Set<string> {
+  const ids = new Set<string>()
+  const bt = backendType.replace(/\uFEFF/g, '').trim()
+  ids.add(bt)
+  // linux-vulkan-x64 ↔ ubuntu-vulkan-x64
+  if (bt === 'linux-vulkan-x64') ids.add('ubuntu-vulkan-x64')
+  if (bt === 'linux-vulkan-arm64') ids.add('ubuntu-vulkan-arm64')
+  if (bt === 'linux-cpu-x64') ids.add('ubuntu-x64')
+  if (bt === 'linux-cpu-arm64') ids.add('ubuntu-arm64')
+  // Reverse mappings: when the on-disk name is the ubuntu variant
+  if (bt === 'ubuntu-vulkan-x64') ids.add('linux-vulkan-x64')
+  if (bt === 'ubuntu-vulkan-arm64') ids.add('linux-vulkan-arm64')
+  if (bt === 'ubuntu-x64') ids.add('linux-cpu-x64')
+  if (bt === 'ubuntu-arm64') ids.add('linux-cpu-arm64')
+  return ids
+}
+
+/**
  * Find a working, already-installed backend of the SAME type as `backendType`
  * (e.g. `macos-arm64`), regardless of its release tag. Used as a fallback
  * (ATO-179, AC2) when the model's pinned `version_backend` can't be obtained
@@ -768,16 +795,21 @@ export async function isBackendInstalled(
  * interchangeable. We do NOT cross types here (e.g. cuda → cpu) — that is a
  * feature/perf trade-off that must stay an explicit user choice.
  *
+ * ATO-233: also recognises `ubuntu-*` ↔ `linux-*` name equivalents so that
+ * backends installed via "Install Backend from File" with ggml-org upstream
+ * tarball names are found even if the on-disk directory still uses the old
+ * ubuntu name.
+ *
  * Returns the newest (by on-disk mtime, via `order`) matching backend, or
  * `null` when none is installed.
  */
 export async function findCompatibleInstalledBackend(
   backendType: string
 ): Promise<BackendVersion | null> {
-  const normalized = backendType.replace(/\uFEFF/g, '').trim()
+  const equivalents = backendTypeEquivalents(backendType)
   const installed = await getLocalInstalledBackends()
-  const sameType = installed.filter(
-    (b) => b.backend.replace(/\uFEFF/g, '').trim() === normalized
+  const sameType = installed.filter((b) =>
+    equivalents.has(b.backend.replace(/\uFEFF/g, '').trim())
   )
   if (sameType.length === 0) return null
   sameType.sort((a, b) => (b.order ?? 0) - (a.order ?? 0))

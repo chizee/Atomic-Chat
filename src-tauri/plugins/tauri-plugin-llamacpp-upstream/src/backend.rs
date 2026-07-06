@@ -16,6 +16,25 @@ pub fn map_old_backend_to_new(old_backend: String) -> String {
     // upstream. It maps any historical Windows backend id to its closest
     // ggml-org equivalent so old settings still resolve to something we can
     // actually download.
+
+    // ggml-org Ubuntu Linux asset names (ubuntu-*) are produced when users
+    // install backends via "Install Backend from File" using the upstream
+    // ggml-org tarball filename (e.g. llama-bXXXX-bin-ubuntu-vulkan-x64.tar.gz).
+    // Map them to the internal linux-* ids used throughout this extension so
+    // they are recognised by findCompatibleInstalledBackend and the rest of
+    // the backend machinery (ATO-233).
+    if old_backend.starts_with("ubuntu-") {
+        let arch_suffix = if old_backend.contains("-arm64") {
+            "arm64"
+        } else {
+            "x64"
+        };
+        if old_backend.contains("vulkan") {
+            return format!("linux-vulkan-{}", arch_suffix);
+        }
+        return format!("linux-cpu-{}", arch_suffix);
+    }
+
     let is_windows = old_backend.starts_with("win-");
     let is_linux = old_backend.starts_with("linux-");
     let os_prefix = if is_windows {
