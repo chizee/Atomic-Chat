@@ -419,6 +419,7 @@ function LaunchPage() {
     corsEnabled,
     verboseLogs,
     proxyTimeout,
+    defaultModelLocalApiServer,
   } = useLocalApiServer()
   const { serverStatus, setServerStatus } = useAppState()
   const serviceHub = useServiceHub()
@@ -491,7 +492,14 @@ function LaunchPage() {
     refreshRunningModels()
   }, [refreshRunningModels, serverStatus])
 
-  const activeModel = runningModels[0] ?? null
+  // Prefer a locally-running engine model; when none is running (e.g. the
+  // user's current selection is a cloud provider like OpenRouter/OpenAI),
+  // fall back to the "Current Model" shown in the Local API Server panel —
+  // it is kept in sync with the globally selected model/provider (see
+  // `syncModelSelection` in `switchModel.ts`) and is exactly what the proxy
+  // at :1337 will actually route, so agents get configured against it too.
+  const activeModel =
+    runningModels[0] ?? defaultModelLocalApiServer?.model ?? null
 
   const ensureServerRunning = useCallback(async () => {
     if (serverStatus === 'running') return
