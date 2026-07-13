@@ -85,8 +85,8 @@ const AppLayout = () => {
     width: sidebarWidth,
     setLeftPanelWidth,
   } = useLeftPanel()
-  // Feeds live server / model / RAM state into the macOS menu-bar tray.
-  // No-op outside macOS Tauri builds (see hook implementation).
+  // Feeds live server / model / RAM state into the desktop system tray.
+  // No-op outside macOS and Windows Tauri builds (see hook implementation).
   useTrayStatusSync()
   const isSetupCompleted = useSetupCompleted()
 
