@@ -168,7 +168,7 @@ export const getProviderTitle = (provider: string) => {
       // side-by-side with `llamacpp-upstream` (which stays the default),
       // so the `llamacpp` provider carries its real Turboquant name on
       // every platform.
-      return 'Atomic Llama.cpp Turboquant'
+      return 'Llama.cpp Turboquant'
     case 'llamacpp-upstream':
       return 'Llama.cpp'
     case 'mlx':

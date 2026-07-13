@@ -13,7 +13,7 @@
   {
     "key": "mtp",
     "title": "Enable MTP (Multi-Token Prediction)",
-    "description": "Speculative decoding via an MTP head. Built-in Qwen MTP support is detected from the GGUF NextN metadata, regardless of the repository or filename (e.g. [ggml-org/Qwen3.6-27B-MTP-GGUF](https://huggingface.co/ggml-org/Qwen3.6-27B-MTP-GGUF), [ggml-org/Qwen3.6-35B-A3B-MTP-GGUF](https://huggingface.co/ggml-org/Qwen3.6-35B-A3B-MTP-GGUF)). Gemma 4 31B ([am17an/Gemma4-31B-it-GGUF](https://huggingface.co/am17an/Gemma4-31B-it-GGUF)) / 26B-A4B ([AtomicChat/gemma-4-26B-A4B-it-assistant-GGUF](https://huggingface.co/AtomicChat/gemma-4-26B-A4B-it-assistant-GGUF)) use a separate draft head that is downloaded automatically; requires backend build b9553+.",
+    "description": "Speed up generation with a compatible MTP head. Atomic Chat uses a built-in or matching downloaded head when available. Requires an MTP-capable llama.cpp backend and is mutually exclusive with DFlash.",
     "controllerType": "checkbox",
     "controllerProps": {
       "value": false
