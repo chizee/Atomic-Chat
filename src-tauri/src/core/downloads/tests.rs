@@ -1,7 +1,122 @@
 use super::helpers::*;
 use super::models::*;
+use hyper::body::Bytes;
+use hyper::header::{CONTENT_LENGTH, CONTENT_RANGE, RANGE};
+use hyper::service::{make_service_fn, service_fn};
+use hyper::{Body, Request, Response, Server, StatusCode};
 use reqwest::header::HeaderMap;
 use std::collections::HashMap;
+use std::convert::Infallible;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use tauri::test::mock_app;
+
+#[derive(Clone, Copy)]
+enum TestRangeBehavior {
+    Supported,
+    Unsupported,
+    Mismatched,
+}
+
+async fn spawn_interrupted_download_server(
+    range_behavior: TestRangeBehavior,
+) -> (
+    String,
+    Arc<AtomicUsize>,
+    tokio::task::JoinHandle<Result<(), hyper::Error>>,
+) {
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let service_count = request_count.clone();
+    let make_service = make_service_fn(move |_| {
+        let service_count = service_count.clone();
+        async move {
+            Ok::<_, Infallible>(service_fn(move |request: Request<Body>| {
+                let service_count = service_count.clone();
+                async move {
+                    let request_index = service_count.fetch_add(1, Ordering::SeqCst);
+                    let response = if request_index == 0 {
+                        let (mut sender, body) = Body::channel();
+                        tokio::spawn(async move {
+                            sender.send_data(Bytes::from_static(b"abc")).await.unwrap();
+                            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                            sender.abort();
+                        });
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_LENGTH, "6")
+                            .body(body)
+                            .unwrap()
+                    } else if request.headers().get(RANGE).is_some() {
+                        match range_behavior {
+                            TestRangeBehavior::Supported => Response::builder()
+                                .status(StatusCode::PARTIAL_CONTENT)
+                                .header(CONTENT_RANGE, "bytes 3-5/6")
+                                .body(Body::from("def"))
+                                .unwrap(),
+                            TestRangeBehavior::Mismatched => Response::builder()
+                                .status(StatusCode::PARTIAL_CONTENT)
+                                .header(CONTENT_RANGE, "bytes 2-5/6")
+                                .body(Body::from("cdef"))
+                                .unwrap(),
+                            TestRangeBehavior::Unsupported => Response::builder()
+                                .status(StatusCode::OK)
+                                .body(Body::from("abcdef"))
+                                .unwrap(),
+                        }
+                    } else {
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .body(Body::from("abcdef"))
+                            .unwrap()
+                    };
+                    Ok::<_, Infallible>(response)
+                }
+            }))
+        }
+    });
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = Server::from_tcp(listener).unwrap().serve(make_service);
+    let handle = tokio::spawn(server);
+    (
+        format!("http://{address}/model.gguf"),
+        request_count,
+        handle,
+    )
+}
+
+fn test_download_path(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir()
+        .join(format!(
+            "atomic-chat-download-test-{}",
+            uuid::Uuid::new_v4()
+        ))
+        .join(name)
+}
+
+async fn run_interrupted_download_test(
+    range_behavior: TestRangeBehavior,
+) -> (Vec<u8>, usize, std::path::PathBuf) {
+    let (url, request_count, server) = spawn_interrupted_download_server(range_behavior).await;
+    let save_path = test_download_path("model.gguf");
+    let item = DownloadItem {
+        url,
+        save_path: save_path.to_string_lossy().into_owned(),
+        proxy: None,
+        sha256: None,
+        size: Some(6),
+        model_id: Some("test/model".to_string()),
+    };
+    let app = mock_app();
+    download_single_file_for_test(app.handle().clone(), &item, &save_path, 6)
+        .await
+        .unwrap();
+    let bytes = tokio::fs::read(&save_path).await.unwrap();
+    let requests = request_count.load(Ordering::SeqCst);
+    server.abort();
+    (bytes, requests, save_path)
+}
 
 // Helper function to create a minimal proxy config for testing
 fn create_test_proxy_config(url: &str) -> ProxyConfig {
@@ -287,6 +402,36 @@ fn test_err_to_string() {
     let error = "Test error";
     let result = err_to_string(error);
     assert_eq!(result, "Error: Test error");
+}
+
+#[tokio::test]
+async fn resumes_an_interrupted_download_from_the_persisted_offset() {
+    let (bytes, requests, save_path) =
+        run_interrupted_download_test(TestRangeBehavior::Supported).await;
+
+    assert_eq!(bytes, b"abcdef");
+    assert_eq!(requests, 2);
+    let _ = tokio::fs::remove_dir_all(save_path.parent().unwrap()).await;
+}
+
+#[tokio::test]
+async fn restarts_an_interrupted_download_when_ranges_are_unsupported() {
+    let (bytes, requests, save_path) =
+        run_interrupted_download_test(TestRangeBehavior::Unsupported).await;
+
+    assert_eq!(bytes, b"abcdef");
+    assert_eq!(requests, 3);
+    let _ = tokio::fs::remove_dir_all(save_path.parent().unwrap()).await;
+}
+
+#[tokio::test]
+async fn restarts_an_interrupted_download_when_content_range_is_mismatched() {
+    let (bytes, requests, save_path) =
+        run_interrupted_download_test(TestRangeBehavior::Mismatched).await;
+
+    assert_eq!(bytes, b"abcdef");
+    assert_eq!(requests, 3);
+    let _ = tokio::fs::remove_dir_all(save_path.parent().unwrap()).await;
 }
 
 #[test]
