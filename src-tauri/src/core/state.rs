@@ -8,9 +8,12 @@ use rmcp::{
 };
 use tokio::sync::{oneshot, Mutex, Notify};
 
-/// Server handle type for managing the proxy server lifecycle
-pub type ServerHandle =
-    tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>;
+/// Handles owned by one Local API Server run.
+pub struct ServerHandle {
+    pub server_task: tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+    pub analytics_task: tokio::task::JoinHandle<()>,
+    pub analytics_shutdown: oneshot::Sender<()>,
+}
 
 /// Provider configuration for remote model providers
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]

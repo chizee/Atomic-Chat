@@ -220,9 +220,7 @@ pub fn list_models(engine: &str) -> Vec<ModelEntry> {
 /// Detect which engine owns `model_id` by probing the data folder, and
 /// resolve its paths.  Tries `llamacpp` first, then `mlx`.
 /// Returns `(engine, model_path, mmproj_path)`.
-pub fn resolve_model_engine(
-    model_id: &str,
-) -> Result<(String, PathBuf, Option<PathBuf>), String> {
+pub fn resolve_model_engine(model_id: &str) -> Result<(String, PathBuf, Option<PathBuf>), String> {
     let data_folder = resolve_jan_data_folder();
     for engine in &["llamacpp", "mlx"] {
         let yml_path = data_folder

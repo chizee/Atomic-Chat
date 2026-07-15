@@ -14,10 +14,10 @@ use jan_utils::generate_app_token;
 use std::{collections::HashMap, sync::Arc};
 #[cfg(not(feature = "cli"))]
 use tauri::{Emitter, Manager, RunEvent};
-#[cfg(not(feature = "cli"))]
-use tauri_plugin_store::StoreExt;
 #[cfg(all(not(feature = "cli"), target_os = "windows"))]
 use tauri_plugin_llamacpp_upstream::install_bundled_backend;
+#[cfg(not(feature = "cli"))]
+use tauri_plugin_store::StoreExt;
 #[cfg(not(feature = "cli"))]
 use tokio::sync::Mutex;
 
@@ -548,6 +548,12 @@ pub fn run() {
                     use crate::core::mcp::helpers::background_cleanup_mcp_servers;
 
                     let state = app_handle.state::<AppState>();
+
+                    if let Err(e) =
+                        crate::core::server::proxy::stop_server(state.server_handle.clone()).await
+                    {
+                        log::warn!("Local API Server shutdown failed: {e}");
+                    }
 
                     // Increase timeout to 10 seconds and log if it times out
                     let cleanup_future = background_cleanup_mcp_servers(&app_handle, &state);

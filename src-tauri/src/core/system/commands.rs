@@ -1078,22 +1078,14 @@ pub fn configure_hermes_agent(
     // Hermes Agent rejects any model whose context window is below 64K, so the
     // fallback must satisfy that floor too (the UI passes 65536 explicitly).
     let ctx = context_length.unwrap_or(65536);
-    let after_cp = upsert_atomic_provider(
-        &after_model_patch,
-        &api_url,
-        &model,
-        ctx,
-    );
+    let after_cp = upsert_atomic_provider(&after_model_patch, &api_url, &model, ctx);
 
     // Seed a per-request timeout for the `custom` provider (the id our model
     // section uses). Hermes reads `providers.<id>.request_timeout_seconds`
     // (run_agent.py::get_provider_request_timeout); without it the legacy
     // 1800s default applies. Any value the user already set is preserved.
-    let after_timeout = upsert_provider_request_timeout(
-        &after_cp,
-        "custom",
-        HERMES_REQUEST_TIMEOUT_SECONDS,
-    );
+    let after_timeout =
+        upsert_provider_request_timeout(&after_cp, "custom", HERMES_REQUEST_TIMEOUT_SECONDS);
 
     let final_content = if content.ends_with('\n') && !after_timeout.ends_with('\n') {
         format!("{}\n", after_timeout)
@@ -1317,7 +1309,11 @@ fn split_custom_providers(content: &str) -> (Vec<String>, Vec<Vec<String>>, Vec<
     let mut after: Vec<String> = Vec::new();
 
     #[derive(PartialEq)]
-    enum Phase { Before, InBlock, After }
+    enum Phase {
+        Before,
+        InBlock,
+        After,
+    }
     let mut phase = Phase::Before;
 
     for line in content.lines() {
@@ -1614,7 +1610,12 @@ fn agent_install_spec(
     match agent_id {
         "claude-code" => {
             let (p, a) = npm("@anthropic-ai/claude-code");
-            Ok((p, a, "npm", "https://docs.anthropic.com/en/docs/claude-code"))
+            Ok((
+                p,
+                a,
+                "npm",
+                "https://docs.anthropic.com/en/docs/claude-code",
+            ))
         }
         "codex" => {
             let (p, a) = npm("@openai/codex");
@@ -1626,7 +1627,12 @@ fn agent_install_spec(
         }
         "cline" => {
             let (p, a) = npm("cline");
-            Ok((p, a, "npm", "https://docs.cline.bot/cline-cli/getting-started"))
+            Ok((
+                p,
+                a,
+                "npm",
+                "https://docs.cline.bot/cline-cli/getting-started",
+            ))
         }
         "mimo" => {
             let (p, a) = npm("@mimo-ai/cli");
@@ -1735,16 +1741,16 @@ fn agent_install_spec(
                 )
             };
             let prereq = if cfg!(windows) { "powershell" } else { "curl" };
-            Ok((program, args, prereq, "https://github.com/NousResearch/hermes-agent"))
+            Ok((
+                program,
+                args,
+                prereq,
+                "https://github.com/NousResearch/hermes-agent",
+            ))
         }
         "openclaude" => {
             let (p, a) = npm("@gitlawb/openclaude");
-            Ok((
-                p,
-                a,
-                "npm",
-                "https://github.com/Gitlawb/openclaude",
-            ))
+            Ok((p, a, "npm", "https://github.com/Gitlawb/openclaude"))
         }
         "poolside" => {
             // Poolside ships via an official shell / PowerShell bootstrap script.
@@ -1970,9 +1976,7 @@ fn apply_runtime_path(_cmd: &mut std::process::Command) {}
 fn decode_console_bytes(bytes: &[u8]) -> String {
     match std::str::from_utf8(bytes) {
         Ok(s) => s.to_string(),
-        Err(_) => {
-            decode_oem(bytes).unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned())
-        }
+        Err(_) => decode_oem(bytes).unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned()),
     }
 }
 
@@ -2048,13 +2052,16 @@ fn apply_proxy_env(cmd: &mut std::process::Command, proxy: &ProxyEnv) {
     if url.is_empty() {
         return;
     }
-    let full = proxy_url_with_auth(
-        url,
-        proxy.username.as_deref(),
-        proxy.password.as_deref(),
-    );
+    let full = proxy_url_with_auth(url, proxy.username.as_deref(), proxy.password.as_deref());
 
-    for key in ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] {
+    for key in [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
         cmd.env(key, &full);
     }
 
@@ -2169,10 +2176,7 @@ async fn detect_via_wsl(bin: &str) -> bool {
 /// 3. (Windows only) a WSL fallback so agents installed inside a WSL
 ///    distribution are detected instead of showing as missing.
 #[tauri::command]
-pub async fn detect_agent_installed(
-    bin: String,
-    custom_path: Option<String>,
-) -> AgentDetection {
+pub async fn detect_agent_installed(bin: String, custom_path: Option<String>) -> AgentDetection {
     if let Some(path) = custom_path
         .as_deref()
         .map(str::trim)
@@ -3028,9 +3032,7 @@ pub fn configure_openclaw(
         .ok()
         .filter(|p| !p.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(&home).join(".openclaw").join("openclaw.json")
-        });
+        .unwrap_or_else(|| PathBuf::from(&home).join(".openclaw").join("openclaw.json"));
 
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent)
@@ -3211,10 +3213,7 @@ pub fn configure_claude_code(
     }
     let env_obj = env.as_object_mut().unwrap();
     // Claude Code appends its own `/v1`, so `api_url` here is the bare host:port.
-    env_obj.insert(
-        "ANTHROPIC_BASE_URL".to_string(),
-        serde_json::json!(api_url),
-    );
+    env_obj.insert("ANTHROPIC_BASE_URL".to_string(), serde_json::json!(api_url));
     env_obj.insert(
         "ANTHROPIC_AUTH_TOKEN".to_string(),
         serde_json::json!(key_val),
@@ -3314,10 +3313,7 @@ pub fn configure_copilot(
     env_vars.push(("COPILOT_MODEL".to_string(), model.clone()));
     env_vars.push(("COPILOT_OFFLINE".to_string(), "true".to_string()));
     if let Some(key) = api_key.as_deref().filter(|k| !k.is_empty()) {
-        env_vars.push((
-            "COPILOT_PROVIDER_API_KEY".to_string(),
-            key.to_string(),
-        ));
+        env_vars.push(("COPILOT_PROVIDER_API_KEY".to_string(), key.to_string()));
     }
 
     const MARKER: &str = "# Atomic Chat - Copilot CLI Config";
@@ -3360,15 +3356,10 @@ pub fn configure_copilot(
 /// providers / keys preserved). Pi speaks OpenAI Chat Completions, so `api_url`
 /// carries the `/v1` suffix.
 #[tauri::command]
-pub fn configure_pi(
-    api_url: String,
-    model: String,
-    api_key: Option<String>,
-) -> Result<(), String> {
+pub fn configure_pi(api_url: String, model: String, api_key: Option<String>) -> Result<(), String> {
     let home = agent_home_dir()?;
     let dir = PathBuf::from(&home).join(".pi").join("agent");
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("Failed to create ~/.pi/agent: {}", e))?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create ~/.pi/agent: {}", e))?;
 
     let key_val = api_key
         .as_deref()
@@ -3814,10 +3805,7 @@ pub fn configure_cline(
 /// using a just-configured agent in one click. The terminal stays open after
 /// the command (it launches an interactive TUI agent like codex/claude).
 #[tauri::command]
-pub fn open_agent_terminal(
-    command: String,
-    proxy: Option<ProxyEnv>,
-) -> Result<(), String> {
+pub fn open_agent_terminal(command: String, proxy: Option<ProxyEnv>) -> Result<(), String> {
     let command = command.trim().to_string();
     if command.is_empty() {
         return Err("Empty terminal command".to_string());

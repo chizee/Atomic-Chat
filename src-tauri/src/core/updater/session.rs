@@ -27,7 +27,7 @@ pub fn get_session_id_with_app<R: Runtime>(app: &AppHandle<R>) -> String {
     if let Some(cached) = CACHED_SESSION_ID.get() {
         return cached.clone();
     }
-    
+
     let session_id = match app.store(STORE_NAME) {
         Ok(store) => {
             // Try to get existing session ID
@@ -47,10 +47,10 @@ pub fn get_session_id_with_app<R: Runtime>(app: &AppHandle<R>) -> String {
             get_session_id_fallback()
         }
     };
-    
+
     // Cache the ID
     let _ = CACHED_SESSION_ID.set(session_id.clone());
-    
+
     session_id
 }
 
@@ -58,10 +58,10 @@ pub fn get_session_id_with_app<R: Runtime>(app: &AppHandle<R>) -> String {
 fn generate_and_save_session(store: &tauri_plugin_store::Store<impl Runtime>) -> String {
     let new_id = Uuid::new_v4().to_string();
     log::debug!("Generated new session");
-    
+
     // Save to store (store.set returns () in this version)
     store.set(SESSION_KEY, serde_json::json!(new_id));
-    
+
     new_id
 }
 
@@ -71,7 +71,7 @@ pub fn get_session_id() -> String {
     if let Some(cached) = CACHED_SESSION_ID.get() {
         return cached.clone();
     }
-    
+
     get_session_id_fallback()
 }
 
