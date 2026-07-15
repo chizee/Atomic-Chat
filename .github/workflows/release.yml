@@ -673,7 +673,7 @@ jobs:
           $maxAttempts = 5
           for ($i = 1; $i -le $maxAttempts; $i++) {
             try {
-              Invoke-WebRequest -Uri "https://github.com/ebourg/jsign/releases/download/6.0/jsign-6.0.jar" `
+              Invoke-WebRequest -Uri "https://github.com/ebourg/jsign/releases/download/7.4/jsign-7.4.jar" `
                 -OutFile $jsign
               if ((Get-Item $jsign).Length -gt 0) { break }
               throw "Downloaded file is empty"
